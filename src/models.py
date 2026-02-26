@@ -3,7 +3,7 @@ import uuid
 from abc import ABC, abstractmethod
 from enum import Enum
 
-from utils import (
+from .utils import (
     InsufficientFundsError,
     AccountFrozenError,
     AccountClosedError,
@@ -15,6 +15,15 @@ class AccountType(Enum):
     ACTIVE = "active"
     FROZEN = "frozen"
     CLOSED = "closed"
+
+
+class Currency(Enum):
+    RUB = "RUB"
+    USD = "USD"
+    EUR = "EUR"
+    KZT = "KZT"
+    CNY = "CNY"
+
 
 class AbstractAccount(ABC):
     unique_index: str
@@ -36,44 +45,59 @@ class AbstractAccount(ABC):
 
 
 class BankAccount(AbstractAccount):
-    def __init__(self, user_data: dict, unique_index: str = None, currency: str = "RUB"):
+    def __init__(
+        self,
+        user_data: dict,
+        unique_index: str = None,
+        currency: Currency = Currency.RUB,
+        account_status: AccountType = AccountType.ACTIVE,
+    ):
         self.unique_index = unique_index if unique_index else uuid.uuid4().hex
         self.user_data = user_data
         self._balance = 0.0
-        self.account_status = AccountType.ACTIVE
-        self.currency = currency # RUB, USD, EUR, KZT, CNY
-            
+        self.account_status = account_status
+        if isinstance(currency, Currency):
+            self.currency = currency
+        else:
+            raise InvalidOperationError(
+                "Неверный тип валюты. Ожидается экземпляр класса Currency."
+            )
+
+    @property
+    def balance(self) -> float:
+        return self._balance
+
     def deposit(self, amount: float) -> None:
         self.check_account_availability()
-        
+
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
-        
+
         self._balance += amount
-        
+
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
-        
+
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
-        
+
         if amount > self._balance:
-            raise InsufficientFundsError()
-    
+            raise InsufficientFundsError("Недостаточно средств.")
+
         self._balance -= amount
 
-    def transfer(self, counterparty: "BankAccount", amount: float) -> bool:
+    def transfer(self, counterparty: "BankAccount", amount: float) -> None:
         self.check_account_availability()
         counterparty.check_account_availability()
-        
+
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
-        
+
         if amount > self._balance:
-            raise InsufficientFundsError("Insufficient funds.")
-        
+            raise InsufficientFundsError("Недостаточно средств.")
+
         converted_amount = self.currency_conversion(counterparty.currency, amount)
-        
+
         counterparty._balance += converted_amount
         self._balance -= amount
 
@@ -83,24 +107,24 @@ class BankAccount(AbstractAccount):
             "user_data": self.user_data,
             "balance": self._balance,
             "account_status": self.account_status.value,
-            "currency": self.currency,
+            "currency": self.currency.value,
         }
-        
+
     def check_account_availability(self) -> bool:
         if self.account_status == AccountType.FROZEN:
-            raise AccountFrozenError
+            raise AccountFrozenError()
         elif self.account_status == AccountType.CLOSED:
-            raise AccountClosedError
+            raise AccountClosedError()
         else:
             return True
-        
-    def currency_conversion(self, target_currency: str, amount: float) -> float:
+
+    def currency_conversion(self, target_currency: Currency, amount: float) -> float:
         exchange_rates = {
-            "RUB": 1.0,
-            "USD": 0.013,
-            "EUR": 0.011,
-            "KZT": 5.5,
-            "CNY": 0.085,
+            Currency.RUB: 1.0,
+            Currency.USD: 0.013,
+            Currency.EUR: 0.011,
+            Currency.KZT: 5.5,
+            Currency.CNY: 0.085,
         }
 
         if self.currency not in exchange_rates:
@@ -112,18 +136,18 @@ class BankAccount(AbstractAccount):
         amount_in_rub = amount / exchange_rates[self.currency]
 
         return amount_in_rub * exchange_rates[target_currency]
-    
+
     def freeze_account(self) -> None:
         self.account_status = AccountType.FROZEN
-        
+
     def close_account(self) -> None:
         self.account_status = AccountType.CLOSED
-        
+
     def __str__(self) -> str:
         return (
             f"Тип счета: {self.__class__.__name__}\n"
             f"Данные пользователя: {self.user_data}\n"
             f"Индекс: {self.unique_index[-4:]}\n"
             f"Статус: {self.account_status.value}\n"
-            f"Баланс: {self._balance} {self.currency}"
+            f"Баланс: {self._balance} {self.currency.value}"
         )

@@ -1,4 +1,4 @@
-from models import BankAccount, Currency
+from src.models import BankAccount, Currency
 
 oleg_rub_account = BankAccount(user_data={"name": "Oleg", "surname": "Ezhikov"}, currency=Currency.RUB)
 john_usd_account = BankAccount(user_data={"name": "John", "surname": "Doe"}, currency=Currency.USD)

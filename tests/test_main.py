@@ -2,12 +2,11 @@ import pytest
 
 from src.models import (
     BankAccount,
-    SavingsAccount,
-    PremiumAccount,
-    InvestmentAccount,
     Currency,
+    InvestmentAccount,
+    PremiumAccount,
+    SavingsAccount,
 )
-
 from src.utils import (
     InsufficientFundsError,
 )
@@ -54,7 +53,9 @@ def test_transfer(user):
     assert acc1.balance == 500
     assert acc2.balance == 500
 
+
 # Тесты для SavingsAccount
+
 
 def test_savings_min_balance(user):
     acc = SavingsAccount(user, min_balance=500)
@@ -73,7 +74,9 @@ def test_savings_interest(user):
 
     assert acc.balance == 1100
 
+
 # Тесты для PremiumAccount
+
 
 def test_premium_overdraft(user):
     acc = PremiumAccount(user, overdraft_limit=1000)
@@ -94,6 +97,7 @@ def test_premium_overdraft_limit(user):
 
 
 # Тесты для InvestmentAccount
+
 
 def test_buy_investment(user):
     acc = InvestmentAccount(user)

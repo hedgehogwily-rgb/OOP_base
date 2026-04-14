@@ -1,7 +1,11 @@
 from src.models import BankAccount, Currency
 
-oleg_rub_account = BankAccount(user_data={"name": "Oleg", "surname": "Ezhikov"}, currency=Currency.RUB)
-john_usd_account = BankAccount(user_data={"name": "John", "surname": "Doe"}, currency=Currency.USD)
+oleg_rub_account = BankAccount(
+    user_data={"name": "Oleg", "surname": "Ezhikov"}, currency=Currency.RUB
+)
+john_usd_account = BankAccount(
+    user_data={"name": "John", "surname": "Doe"}, currency=Currency.USD
+)
 
 oleg_rub_account_info = "1"
 john_usd_account_info = "2"
@@ -23,16 +27,15 @@ text = (
     f"{oleg_withdraw} - снять деньги со счета Олега\n"
     f"{freeze_john_account} - заморозить счет Джона\n"
     f"{close_john_account} - закрыть счет Джона\n"
-    f"{exit_program} - выйти из программы\n"    
+    f"{exit_program} - выйти из программы\n"
 )
 
 
-
-def cli_app():
+def cli_app() -> None:
     while True:
         print(text)
         user_input = input("Введите номер операции: ")
-        
+
         if user_input == oleg_rub_account_info:
             print(oleg_rub_account)
         elif user_input == john_usd_account_info:
@@ -92,7 +95,7 @@ def cli_app():
             break
         else:
             print("Неверный ввод. Пожалуйста, попробуйте снова.")
-            
-            
+
+
 if __name__ == "__main__":
     cli_app()

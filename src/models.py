@@ -1,12 +1,12 @@
 import uuid
-
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Any, TypedDict
 
 from src.utils import (
-    InsufficientFundsError,
-    AccountFrozenError,
     AccountClosedError,
+    AccountFrozenError,
+    InsufficientFundsError,
     InvalidOperationError,
 )
 
@@ -25,11 +25,24 @@ class Currency(Enum):
     CNY = "CNY"
 
 
+class UserData(TypedDict, total=False):
+    name: str
+    surname: str
+    id: int
+
+
+InvestmentPortfolio = dict[str, float]
+
+
 class AbstractAccount(ABC):
     unique_index: str
-    user_data: dict
-    balance: float
+    user_data: UserData | dict[str, Any]
     account_status: AccountType  # e.g., 'active', 'frozen', 'closed'
+
+    @property
+    @abstractmethod
+    def balance(self) -> float:
+        pass
 
     @abstractmethod
     def deposit(self, amount: float) -> None:
@@ -40,15 +53,15 @@ class AbstractAccount(ABC):
         pass
 
     @abstractmethod
-    def get_account_info(self) -> dict:
+    def get_account_info(self) -> dict[str, Any]:
         pass
 
 
 class BankAccount(AbstractAccount):
     def __init__(
         self,
-        user_data: dict,
-        unique_index: str = None,
+        user_data: UserData | dict[str, Any],
+        unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
     ):
@@ -98,10 +111,10 @@ class BankAccount(AbstractAccount):
 
         converted_amount = self.currency_conversion(counterparty.currency, amount)
 
-        counterparty._balance += converted_amount
+        counterparty.deposit(converted_amount)
         self._balance -= amount
 
-    def get_account_info(self) -> dict:
+    def get_account_info(self) -> dict[str, Any]:
         return {
             "unique_index": str(self.unique_index),
             "user_data": self.user_data,
@@ -156,8 +169,8 @@ class BankAccount(AbstractAccount):
 class SavingsAccount(BankAccount):
     def __init__(
         self,
-        user_data: dict,
-        unique_index: str = None,
+        user_data: UserData | dict[str, Any],
+        unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
         interest_rate: float = 0.02,
@@ -167,7 +180,7 @@ class SavingsAccount(BankAccount):
         self.interest_rate = interest_rate
         self.min_balance = min_balance
 
-    def withdraw(self, amount) -> None:
+    def withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -185,7 +198,7 @@ class SavingsAccount(BankAccount):
         interest = self._balance * self.interest_rate
         self._balance += interest
 
-    def get_account_info(self) -> dict:
+    def get_account_info(self) -> dict[str, Any]:
         base_info = super().get_account_info()
         base_info.update(
             {
@@ -208,8 +221,8 @@ class SavingsAccount(BankAccount):
 class PremiumAccount(BankAccount):
     def __init__(
         self,
-        user_data: dict,
-        unique_index: str = None,
+        user_data: UserData | dict[str, Any],
+        unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
         overdraft_limit: float = 1000.0,
@@ -220,7 +233,7 @@ class PremiumAccount(BankAccount):
         self.available_overdraft = overdraft_limit
         self.commission_rate = commission_rate
 
-    def withdraw(self, amount) -> None:
+    def withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -258,7 +271,7 @@ class PremiumAccount(BankAccount):
         else:
             self._balance += amount
 
-    def get_account_info(self) -> dict:
+    def get_account_info(self) -> dict[str, Any]:
         base_info = super().get_account_info()
         base_info.update(
             {
@@ -283,13 +296,13 @@ class PremiumAccount(BankAccount):
 class InvestmentAccount(BankAccount):
     def __init__(
         self,
-        user_data: dict,
-        unique_index: str = None,
+        user_data: UserData | dict[str, Any],
+        unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
     ):
         super().__init__(user_data, unique_index, currency, account_status)
-        self.investment_portfolio = {
+        self.investment_portfolio: InvestmentPortfolio = {
             "stocks": 0.0,
             "bonds": 0.0,
             "etf": 0.0,
@@ -325,11 +338,11 @@ class InvestmentAccount(BankAccount):
         self.investment_portfolio[investment_type] -= amount
         self._balance += amount
 
-    def project_yearly_growth(self, growth_rate: float = 0.25) -> dict:
+    def project_yearly_growth(self, growth_rate: float = 0.25) -> dict[str, float]:
         if growth_rate < 0:
             raise InvalidOperationError("Темп роста должен быть неотрицательным.")
-        
-        projected_portfolio = {}
+
+        projected_portfolio: dict[str, float] = {}
         for investment_type, amount in self.investment_portfolio.items():
             projected_amount = amount * (1 + growth_rate)
             projected_portfolio[investment_type] = projected_amount
@@ -339,7 +352,7 @@ class InvestmentAccount(BankAccount):
         # Переопределяем метод таким образом, чтобы запретить прямые снятия со счета, так как деньги должны быть в инвестициях
         raise InvalidOperationError("Прямые снятия с инвестиционного счета запрещены.")
 
-    def get_account_info(self) -> dict:
+    def get_account_info(self) -> dict[str, Any]:
         base_info = super().get_account_info()
         base_info.update(
             {

@@ -9,6 +9,7 @@ from src.models import (
 )
 from src.utils import (
     InsufficientFundsError,
+    InvalidOperationError,
 )
 
 
@@ -130,3 +131,8 @@ def test_project_growth(user):
     projection = acc.project_yearly_growth(0.1)
 
     assert projection["stocks"] == 5500
+
+
+def test_invalid_account_status_type(user):
+    with pytest.raises(InvalidOperationError):
+        BankAccount(user, account_status="frozen")  # type: ignore[arg-type]

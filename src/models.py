@@ -68,7 +68,12 @@ class BankAccount(AbstractAccount):
         self.unique_index = unique_index if unique_index else uuid.uuid4().hex
         self.user_data = user_data
         self._balance = 0.0
-        self.account_status = account_status
+        if isinstance(account_status, AccountType):
+            self.account_status = account_status
+        else:
+            raise InvalidOperationError(
+                "Неверный тип статуса. Ожидается экземпляр класса AccountType."
+            )
         if isinstance(currency, Currency):
             self.currency = currency
         else:
@@ -128,6 +133,8 @@ class BankAccount(AbstractAccount):
             raise AccountFrozenError()
         elif self.account_status == AccountType.CLOSED:
             raise AccountClosedError()
+        elif self.account_status != AccountType.ACTIVE:
+            raise InvalidOperationError("Недопустимое значение статуса счета.")
         else:
             return True
 

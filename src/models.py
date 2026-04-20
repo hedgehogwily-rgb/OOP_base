@@ -65,8 +65,8 @@ class BankAccount(AbstractAccount):
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
     ):
-        self.unique_index = unique_index if unique_index else uuid.uuid4().hex
-        self.user_data = user_data
+        self.unique_index = unique_index if unique_index else uuid.uuid4().hex[:8]
+        self.user_data = self._validate_user_data(user_data)
         self._balance = 0.0
         if isinstance(account_status, AccountType):
             self.account_status = account_status
@@ -80,6 +80,29 @@ class BankAccount(AbstractAccount):
             raise InvalidOperationError(
                 "Неверный тип валюты. Ожидается экземпляр класса Currency."
             )
+
+    @staticmethod
+    def _validate_user_data(user_data: UserData | dict[str, Any]) -> UserData | dict[str, Any]:
+        if not isinstance(user_data, dict):
+            raise InvalidOperationError(
+                "Неверный формат user_data. Ожидается словарь с данными пользователя."
+            )
+
+        if not user_data:
+            raise InvalidOperationError("Данные пользователя не могут быть пустыми.")
+
+        for field_name in ("name", "surname"):
+            if field_name in user_data:
+                field_value = user_data[field_name]
+                if not isinstance(field_value, str) or not field_value.strip():
+                    raise InvalidOperationError(
+                        f"Поле '{field_name}' должно быть непустой строкой."
+                    )
+
+        if "id" in user_data and not isinstance(user_data["id"], int):
+            raise InvalidOperationError("Поле 'id' должно быть целым числом.")
+
+        return user_data
 
     @property
     def balance(self) -> float:
@@ -200,7 +223,7 @@ class SavingsAccount(BankAccount):
 
         super().withdraw(amount)
 
-    def apply_interest_for_month(self) -> None:
+    def apply_monthly_interest(self) -> None:
         self.check_account_availability()
         interest = self._balance * self.interest_rate
         self._balance += interest
@@ -356,7 +379,8 @@ class InvestmentAccount(BankAccount):
         return projected_portfolio
 
     def withdraw(self, amount: float) -> None:
-        # Переопределяем метод таким образом, чтобы запретить прямые снятия со счета, так как деньги должны быть в инвестициях
+        self.check_account_availability()
+        # Прямые снятия запрещены, вывод средств должен происходить через продажу активов.
         raise InvalidOperationError("Прямые снятия с инвестиционного счета запрещены.")
 
     def get_account_info(self) -> dict[str, Any]:

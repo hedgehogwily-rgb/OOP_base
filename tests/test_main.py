@@ -1,6 +1,7 @@
 import pytest
 
 from src.models import (
+    AccountType,
     BankAccount,
     Currency,
     InvestmentAccount,
@@ -8,6 +9,8 @@ from src.models import (
     SavingsAccount,
 )
 from src.utils import (
+    AccountClosedError,
+    AccountFrozenError,
     InsufficientFundsError,
     InvalidOperationError,
 )
@@ -71,7 +74,7 @@ def test_savings_interest(user):
     acc = SavingsAccount(user, interest_rate=0.1)
 
     acc.deposit(1000)
-    acc.apply_interest_for_month()
+    acc.apply_monthly_interest()
 
     assert acc.balance == 1100
 
@@ -136,3 +139,32 @@ def test_project_growth(user):
 def test_invalid_account_status_type(user):
     with pytest.raises(InvalidOperationError):
         BankAccount(user, account_status="frozen")  # type: ignore[arg-type]
+
+
+def test_unique_index_is_short_uuid(user):
+    acc = BankAccount(user)
+    assert len(acc.unique_index) == 8
+
+
+def test_invalid_user_data_empty_dict():
+    with pytest.raises(InvalidOperationError):
+        BankAccount({})
+
+
+def test_invalid_user_data_name_type():
+    with pytest.raises(InvalidOperationError):
+        BankAccount({"name": 123, "id": 1})  # type: ignore[dict-item]
+
+
+def test_investment_withdraw_checks_frozen_status_first(user):
+    acc = InvestmentAccount(user, account_status=AccountType.FROZEN)
+
+    with pytest.raises(AccountFrozenError):
+        acc.withdraw(100)
+
+
+def test_investment_withdraw_checks_closed_status_first(user):
+    acc = InvestmentAccount(user, account_status=AccountType.CLOSED)
+
+    with pytest.raises(AccountClosedError):
+        acc.withdraw(100)

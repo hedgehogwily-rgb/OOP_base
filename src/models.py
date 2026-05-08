@@ -1,7 +1,8 @@
 import uuid
+from datetime import datetime
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 from src.utils import (
     AccountClosedError,
@@ -15,6 +16,11 @@ class AccountType(Enum):
     ACTIVE = "active"
     FROZEN = "frozen"
     CLOSED = "closed"
+
+
+class ClientStatus(Enum):
+    ACTIVE = "active"
+    LOCKED = "locked"   
 
 
 class Currency(Enum):
@@ -401,3 +407,245 @@ class InvestmentAccount(BankAccount):
                 f"\n  {investment_type.capitalize()}: {amount} {self.currency.value}"
             )
         return str_info
+
+
+class Client:
+    def __init__(
+        self,
+        name: str,
+        surname: str,
+        id: int,
+        age: int,
+        contacts: list[str] | None = None,
+        status: ClientStatus = ClientStatus.ACTIVE,
+    ):
+        self.name = self._validate_non_empty_str(name, "name")
+        self.surname = self._validate_non_empty_str(surname, "surname")
+        if not isinstance(id, int):
+            raise InvalidOperationError("ID клиента должен быть целым числом.")
+        self.id = id
+        self.age = age
+        self.check_age()
+        self.status = status
+        self.contacts = self._validate_contacts(contacts or [])
+        self.account_ids: list[str] = []
+
+    @staticmethod
+    def _validate_non_empty_str(value: str, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidOperationError(f"Поле '{field_name}' должно быть непустой строкой.")
+        return value.strip()
+
+    @staticmethod
+    def _validate_contacts(contacts: list[str]) -> list[str]:
+        validated: list[str] = []
+        for contact in contacts:
+            if not isinstance(contact, str) or not contact.strip():
+                raise InvalidOperationError(
+                    "Каждый контакт должен быть непустой строкой."
+                )
+            validated.append(contact.strip())
+        return validated
+
+    def add_account(self, account_id: str) -> None:
+        if account_id not in self.account_ids:
+            self.account_ids.append(account_id)
+
+    def remove_account(self, account_id: str) -> None:
+        if account_id in self.account_ids:
+            self.account_ids.remove(account_id)
+
+    def lock(self) -> None:
+        self.status = ClientStatus.LOCKED
+
+    def unlock(self) -> None:
+        self.status = ClientStatus.ACTIVE
+
+    def check_age(self) -> bool:
+        if self.age < 18:
+            raise InvalidOperationError("Возраст клиента должен быть не меньше 18 лет.")
+        return True
+
+    def get_client_info(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "surname": self.surname,
+            "id": self.id,
+            "age": self.age,
+            "status": self.status,
+            "account_ids": self.account_ids,
+            "contacts": self.contacts,
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"Клиент: {self.name} {self.surname}, ID: {self.id}, "
+            f"Возраст: {self.age}, Статус: {self.status}"
+        )
+
+
+class Bank:
+    def __init__(
+        self,
+        clients: list[Client] | None = None,
+        now_provider: Callable[[], datetime] | None = None,
+    ):
+        self.clients: dict[int, Client] = {}
+        self.accounts: dict[str, BankAccount] = {}
+        self.failed_auth_attempts: dict[int, int] = {}
+        self.suspicious_actions: list[dict[str, Any]] = []
+        self._now_provider = now_provider or datetime.now
+
+        for client in clients or []:
+            self.add_client(client)
+
+    def _mark_suspicious_action(self, client_id: int, reason: str) -> None:
+        self.suspicious_actions.append(
+            {
+                "client_id": client_id,
+                "reason": reason,
+                "timestamp": self._now_provider().isoformat(timespec="seconds"),
+            }
+        )
+
+    def _is_quiet_hours(self) -> bool:
+        current_hour = self._now_provider().hour
+        return 0 <= current_hour < 5
+
+    def _ensure_allowed_operation_time(self, client_id: int) -> None:
+        if self._is_quiet_hours():
+            self._mark_suspicious_action(client_id, "operation_during_quiet_hours")
+            raise InvalidOperationError("Операции запрещены с 00:00 до 05:00.")
+
+    def _get_client(self, client_id: int) -> Client:
+        client = self.clients.get(client_id)
+        if client is None:
+            raise InvalidOperationError("Клиент не найден.")
+        return client
+
+    def _get_account(self, account_id: str) -> BankAccount:
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise InvalidOperationError("Счет не найден.")
+        return account
+
+    def add_client(self, client: Client) -> None:
+        if client.id in self.clients:
+            raise InvalidOperationError("Клиент с таким ID уже существует.")
+        self.clients[client.id] = client
+        self.failed_auth_attempts[client.id] = 0
+
+    def authenticate_client(self, client_id: int, is_credentials_valid: bool) -> bool:
+        client = self._get_client(client_id)
+        if client.status == ClientStatus.LOCKED:
+            self._mark_suspicious_action(client_id, "auth_attempt_for_locked_client")
+            raise InvalidOperationError("Клиент заблокирован.")
+
+        if is_credentials_valid:
+            self.failed_auth_attempts[client_id] = 0
+            return True
+
+        attempts = self.failed_auth_attempts.get(client_id, 0) + 1
+        self.failed_auth_attempts[client_id] = attempts
+        self._mark_suspicious_action(client_id, "failed_auth")
+
+        if attempts >= 3:
+            client.lock()
+            self._mark_suspicious_action(client_id, "client_locked_after_failed_auth")
+        return False
+
+    def open_account(self, client_id: int, account: BankAccount) -> str:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+
+        if client.status != ClientStatus.ACTIVE:
+            raise InvalidOperationError("Открытие счета доступно только активному клиенту.")
+
+        account_id = account.unique_index
+        if account_id in self.accounts:
+            raise InvalidOperationError("Счет с таким идентификатором уже существует.")
+
+        self.accounts[account_id] = account
+        client.add_account(account_id)
+        return account_id
+
+    def close_account(self, client_id: int, account_id: str) -> None:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        account = self._get_account(account_id)
+
+        if account_id not in client.account_ids:
+            self._mark_suspicious_action(client_id, "close_foreign_account_attempt")
+            raise InvalidOperationError("Счет не принадлежит клиенту.")
+
+        account.close_account()
+        client.remove_account(account_id)
+
+    def freeze_account(self, client_id: int, account_id: str) -> None:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        account = self._get_account(account_id)
+        if account_id not in client.account_ids:
+            self._mark_suspicious_action(client_id, "freeze_foreign_account_attempt")
+            raise InvalidOperationError("Счет не принадлежит клиенту.")
+        account.freeze_account()
+
+    def unfreeze_account(self, client_id: int, account_id: str) -> None:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        account = self._get_account(account_id)
+        if account_id not in client.account_ids:
+            self._mark_suspicious_action(client_id, "unfreeze_foreign_account_attempt")
+            raise InvalidOperationError("Счет не принадлежит клиенту.")
+        if account.account_status == AccountType.CLOSED:
+            raise InvalidOperationError("Закрытый счет нельзя разморозить.")
+        if account.account_status != AccountType.FROZEN:
+            raise InvalidOperationError("Разморозить можно только замороженный счет.")
+        account.account_status = AccountType.ACTIVE
+
+    def search_accounts(
+        self,
+        client_id: int | None = None,
+        status: AccountType | None = None,
+        currency: Currency | None = None,
+    ) -> list[BankAccount]:
+        if client_id is not None:
+            client = self._get_client(client_id)
+            accounts = [self.accounts[acc_id] for acc_id in client.account_ids]
+        else:
+            accounts = list(self.accounts.values())
+
+        result: list[BankAccount] = []
+        for account in accounts:
+            if status is not None and account.account_status != status:
+                continue
+            if currency is not None and account.currency != currency:
+                continue
+            result.append(account)
+        return result
+
+    def get_total_balance(self) -> float:
+        total = 0.0
+        for account in self.accounts.values():
+            if account.account_status == AccountType.ACTIVE:
+                total += account.balance
+        return total
+
+    def get_clients_ranking(self) -> list[dict[str, Any]]:
+        ranking: list[dict[str, Any]] = []
+        for client in self.clients.values():
+            balance = sum(
+                self.accounts[acc_id].balance
+                for acc_id in client.account_ids
+                if acc_id in self.accounts
+            )
+            ranking.append(
+                {
+                    "client_id": client.id,
+                    "name": client.name,
+                    "surname": client.surname,
+                    "total_balance": balance,
+                }
+            )
+        ranking.sort(key=lambda item: (-item["total_balance"], item["client_id"]))
+        return ranking

@@ -1,10 +1,36 @@
-from src.models import BankAccount, Currency
+from src.models import Bank, BankAccount, Client, Currency
 
-oleg_rub_account = BankAccount(
-    user_data={"name": "Oleg", "surname": "Ezhikov"}, currency=Currency.RUB
+bank = Bank()
+oleg_client = Client(
+    name="Oleg",
+    surname="Ezhikov",
+    id=1,
+    age=28,
+    contacts=["+7-900-000-00-01"],
 )
-john_usd_account = BankAccount(
-    user_data={"name": "John", "surname": "Doe"}, currency=Currency.USD
+john_client = Client(
+    name="John",
+    surname="Doe",
+    id=2,
+    age=31,
+    contacts=["+7-900-000-00-02"],
+)
+bank.add_client(oleg_client)
+bank.add_client(john_client)
+
+oleg_account_id = bank.open_account(
+    client_id=oleg_client.id,
+    account=BankAccount(
+        user_data={"name": oleg_client.name, "surname": oleg_client.surname},
+        currency=Currency.RUB,
+    ),
+)
+john_account_id = bank.open_account(
+    client_id=john_client.id,
+    account=BankAccount(
+        user_data={"name": john_client.name, "surname": john_client.surname},
+        currency=Currency.USD,
+    ),
 )
 
 oleg_rub_account_info = "1"
@@ -15,6 +41,8 @@ oleg_deposit = "5"
 oleg_withdraw = "6"
 freeze_john_account = "7"
 close_john_account = "8"
+auth_john_fail = "9"
+auth_john_success = "10"
 exit_program = "0"
 
 
@@ -27,19 +55,24 @@ text = (
     f"{oleg_withdraw} - снять деньги со счета Олега\n"
     f"{freeze_john_account} - заморозить счет Джона\n"
     f"{close_john_account} - закрыть счет Джона\n"
+    f"{auth_john_fail} - неудачная авторизация Джона\n"
+    f"{auth_john_success} - успешная авторизация Джона\n"
     f"{exit_program} - выйти из программы\n"
 )
 
 
 def cli_app() -> None:
+    oleg_account = bank.accounts[oleg_account_id]
+    john_account = bank.accounts[john_account_id]
+
     while True:
         print(text)
         user_input = input("Введите номер операции: ")
 
         if user_input == oleg_rub_account_info:
-            print(oleg_rub_account)
+            print(oleg_account)
         elif user_input == john_usd_account_info:
-            print(john_usd_account)
+            print(john_account)
         elif user_input == transfer_oleg_to_john:
             try:
                 amount = float(input("Введите сумму для перевода с Олега на Джона: "))
@@ -47,7 +80,7 @@ def cli_app() -> None:
                 print("Неверный ввод. Пожалуйста, введите числовое значение.")
                 continue
             try:
-                oleg_rub_account.transfer(john_usd_account, amount)
+                oleg_account.transfer(john_account, amount)
                 print(f"Успешно переведено {amount} RUB с Олега на Джона.")
             except Exception as e:
                 print(e)
@@ -58,7 +91,7 @@ def cli_app() -> None:
                 print("Неверный ввод. Пожалуйста, введите числовое значение.")
                 continue
             try:
-                john_usd_account.transfer(oleg_rub_account, amount)
+                john_account.transfer(oleg_account, amount)
                 print(f"Успешно переведено {amount} USD с Джона на Олега.")
             except Exception as e:
                 print(e)
@@ -69,7 +102,7 @@ def cli_app() -> None:
                 print("Неверный ввод. Пожалуйста, введите числовое значение.")
                 continue
             try:
-                oleg_rub_account.deposit(amount)
+                oleg_account.deposit(amount)
                 print(f"Успешно пополнено {amount} RUB на счет Олега.")
             except Exception as e:
                 print(e)
@@ -80,16 +113,33 @@ def cli_app() -> None:
                 print("Неверный ввод. Пожалуйста, введите числовое значение.")
                 continue
             try:
-                oleg_rub_account.withdraw(amount)
+                oleg_account.withdraw(amount)
                 print(f"Успешно снято {amount} RUB со счета Олега.")
             except Exception as e:
                 print(e)
         elif user_input == freeze_john_account:
-            john_usd_account.freeze_account()
-            print("Счет Джона заморожен.")
+            try:
+                bank.freeze_account(john_client.id, john_account_id)
+                print("Счет Джона заморожен.")
+            except Exception as e:
+                print(e)
         elif user_input == close_john_account:
-            john_usd_account.close_account()
-            print("Счет Джона закрыт.")
+            try:
+                bank.close_account(john_client.id, john_account_id)
+                print("Счет Джона закрыт.")
+            except Exception as e:
+                print(e)
+        elif user_input == auth_john_fail:
+            auth_result = bank.authenticate_client(john_client.id, is_credentials_valid=False)
+            print(f"Авторизация Джона: {auth_result}")
+        elif user_input == auth_john_success:
+            try:
+                auth_result = bank.authenticate_client(
+                    john_client.id, is_credentials_valid=True
+                )
+                print(f"Авторизация Джона: {auth_result}")
+            except Exception as e:
+                print(e)
         elif user_input == exit_program:
             print("Выход из программы.")
             break

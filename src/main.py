@@ -1,151 +1,94 @@
-from src.models import Bank, BankAccount, Client, Currency
+from datetime import datetime, timedelta
 
-bank = Bank()
-oleg_client = Client(
-    name="Oleg",
-    surname="Ezhikov",
-    id=1,
-    age=28,
-    contacts=["+7-900-000-00-01"],
-)
-john_client = Client(
-    name="John",
-    surname="Doe",
-    id=2,
-    age=31,
-    contacts=["+7-900-000-00-02"],
-)
-bank.add_client(oleg_client)
-bank.add_client(john_client)
-
-oleg_account_id = bank.open_account(
-    client_id=oleg_client.id,
-    account=BankAccount(
-        user_data={"name": oleg_client.name, "surname": oleg_client.surname},
-        currency=Currency.RUB,
-    ),
-)
-john_account_id = bank.open_account(
-    client_id=john_client.id,
-    account=BankAccount(
-        user_data={"name": john_client.name, "surname": john_client.surname},
-        currency=Currency.USD,
-    ),
-)
-
-oleg_rub_account_info = "1"
-john_usd_account_info = "2"
-transfer_oleg_to_john = "3"
-transfer_john_to_oleg = "4"
-oleg_deposit = "5"
-oleg_withdraw = "6"
-freeze_john_account = "7"
-close_john_account = "8"
-auth_john_fail = "9"
-auth_john_success = "10"
-exit_program = "0"
-
-
-text = (
-    f"{oleg_rub_account_info} - получить информацию о счете Олега\n"
-    f"{john_usd_account_info} - получить информацию о счете Джона\n"
-    f"{transfer_oleg_to_john} - перевести деньги с счета Олега на счет Джона\n"
-    f"{transfer_john_to_oleg} - перевести деньги с счета Джона на счет Олега\n"
-    f"{oleg_deposit} - пополнить счет Олега\n"
-    f"{oleg_withdraw} - снять деньги со счета Олега\n"
-    f"{freeze_john_account} - заморозить счет Джона\n"
-    f"{close_john_account} - закрыть счет Джона\n"
-    f"{auth_john_fail} - неудачная авторизация Джона\n"
-    f"{auth_john_success} - успешная авторизация Джона\n"
-    f"{exit_program} - выйти из программы\n"
+from src.models import (
+    Bank,
+    BankAccount,
+    Client,
+    Currency,
+    PremiumAccount,
+    TransactionProcessor,
+    TransactionQueue,
 )
 
 
-def cli_app() -> None:
-    oleg_account = bank.accounts[oleg_account_id]
-    john_account = bank.accounts[john_account_id]
+def run_day4_demo() -> None:
+    bank = Bank(now_provider=lambda: datetime(2026, 1, 1, 10, 0, 0))
+    queue = TransactionQueue()
+    processor = TransactionProcessor(
+        bank=bank,
+        queue=queue,
+        external_transfer_fee_rate=0.03,
+        retry_delay_seconds=0,
+    )
 
-    while True:
-        print(text)
-        user_input = input("Введите номер операции: ")
+    oleg = Client("Oleg", "Ezhikov", 1, 28, contacts=["+7-900-000-00-01"])
+    john = Client("John", "Doe", 2, 31, contacts=["+7-900-000-00-02"])
+    ivan = Client("Ivan", "Ivanov", 3, 26, contacts=["+7-900-000-00-03"])
+    bank.add_client(oleg)
+    bank.add_client(john)
+    bank.add_client(ivan)
 
-        if user_input == oleg_rub_account_info:
-            print(oleg_account)
-        elif user_input == john_usd_account_info:
-            print(john_account)
-        elif user_input == transfer_oleg_to_john:
-            try:
-                amount = float(input("Введите сумму для перевода с Олега на Джона: "))
-            except ValueError:
-                print("Неверный ввод. Пожалуйста, введите числовое значение.")
-                continue
-            try:
-                oleg_account.transfer(john_account, amount)
-                print(f"Успешно переведено {amount} RUB с Олега на Джона.")
-            except Exception as e:
-                print(e)
-        elif user_input == transfer_john_to_oleg:
-            try:
-                amount = float(input("Введите сумму для перевода с Джона на Олега: "))
-            except ValueError:
-                print("Неверный ввод. Пожалуйста, введите числовое значение.")
-                continue
-            try:
-                john_account.transfer(oleg_account, amount)
-                print(f"Успешно переведено {amount} USD с Джона на Олега.")
-            except Exception as e:
-                print(e)
-        elif user_input == oleg_deposit:
-            try:
-                amount = float(input("Введите сумму для пополнения счета Олега: "))
-            except ValueError:
-                print("Неверный ввод. Пожалуйста, введите числовое значение.")
-                continue
-            try:
-                oleg_account.deposit(amount)
-                print(f"Успешно пополнено {amount} RUB на счет Олега.")
-            except Exception as e:
-                print(e)
-        elif user_input == oleg_withdraw:
-            try:
-                amount = float(input("Введите сумму для снятия со счета Олега: "))
-            except ValueError:
-                print("Неверный ввод. Пожалуйста, введите числовое значение.")
-                continue
-            try:
-                oleg_account.withdraw(amount)
-                print(f"Успешно снято {amount} RUB со счета Олега.")
-            except Exception as e:
-                print(e)
-        elif user_input == freeze_john_account:
-            try:
-                bank.freeze_account(john_client.id, john_account_id)
-                print("Счет Джона заморожен.")
-            except Exception as e:
-                print(e)
-        elif user_input == close_john_account:
-            try:
-                bank.close_account(john_client.id, john_account_id)
-                print("Счет Джона закрыт.")
-            except Exception as e:
-                print(e)
-        elif user_input == auth_john_fail:
-            auth_result = bank.authenticate_client(john_client.id, is_credentials_valid=False)
-            print(f"Авторизация Джона: {auth_result}")
-        elif user_input == auth_john_success:
-            try:
-                auth_result = bank.authenticate_client(
-                    john_client.id, is_credentials_valid=True
-                )
-                print(f"Авторизация Джона: {auth_result}")
-            except Exception as e:
-                print(e)
-        elif user_input == exit_program:
-            print("Выход из программы.")
-            break
-        else:
-            print("Неверный ввод. Пожалуйста, попробуйте снова.")
+    oleg_account_id = bank.open_account(
+        oleg.id,
+        BankAccount({"name": "Oleg", "surname": "Ezhikov"}, currency=Currency.RUB),
+    )
+    john_account_id = bank.open_account(
+        john.id,
+        BankAccount({"name": "John", "surname": "Doe"}, currency=Currency.USD),
+    )
+    ivan_account_id = bank.open_account(
+        ivan.id,
+        PremiumAccount({"name": "Ivan", "surname": "Ivanov"}, currency=Currency.RUB),
+    )
+
+    bank.accounts[oleg_account_id].deposit(10_000)
+    bank.accounts[john_account_id].deposit(400)
+    bank.accounts[ivan_account_id].deposit(200)
+    bank.freeze_account(john.id, john_account_id)
+
+    now = datetime(2026, 1, 1, 10, 0, 0)
+    transactions = [
+        processor.create_transfer(oleg_account_id, ivan_account_id, 1200, priority=5),
+        processor.create_transfer(oleg_account_id, john_account_id, 100, priority=9),
+        processor.create_transfer(ivan_account_id, oleg_account_id, 700, priority=7),
+        processor.create_transfer(john_account_id, oleg_account_id, 50, priority=4),
+        processor.create_transfer(
+            oleg_account_id,
+            ivan_account_id,
+            200,
+            priority=8,
+            scheduled_at=now + timedelta(minutes=15),
+        ),
+        processor.create_transfer(oleg_account_id, ivan_account_id, 150, priority=3),
+        processor.create_transfer(ivan_account_id, john_account_id, 80, priority=6),
+        processor.create_transfer(oleg_account_id, john_account_id, 60, priority=2),
+        processor.create_transfer(oleg_account_id, ivan_account_id, 90, priority=1),
+        processor.create_transfer(ivan_account_id, oleg_account_id, 1800, priority=10),
+    ]
+
+    queue.cancel(transactions[8].id, now=now)
+    first_wave = processor.process_all(now=now)
+    bank.unfreeze_account(john.id, john_account_id)
+    second_wave = processor.process_all(now=now + timedelta(minutes=20))
+
+    print(f"Обработано в первой волне: {len(first_wave)}")
+    print(f"Обработано во второй волне: {len(second_wave)}")
+    print("\nИтоги транзакций:")
+    for transaction in transactions:
+        print(
+            f"{transaction.id} | priority={transaction.priority} | "
+            f"status={transaction.status.value} | attempt={transaction.attempt} | "
+            f"fee={transaction.fee:.2f} | reason={transaction.failure_reason}"
+        )
+
+    print("\nБаланс счетов:")
+    print(f"Oleg: {bank.accounts[oleg_account_id].balance:.2f} RUB")
+    print(f"John: {bank.accounts[john_account_id].balance:.2f} USD")
+    print(f"Ivan: {bank.accounts[ivan_account_id].balance:.2f} RUB")
+    print("\nЛог ошибок:")
+    for log_row in processor.error_log:
+        print(log_row)
 
 
 if __name__ == "__main__":
-    cli_app()
+    run_day4_demo()

@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import uuid
-from datetime import datetime
+import heapq
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, TypedDict
@@ -18,7 +22,7 @@ class AccountType(Enum):
     CLOSED = "closed"
 
 
-class ClientStatus(Enum):
+class ClientStatus(str, Enum):
     ACTIVE = "active"
     LOCKED = "locked"   
 
@@ -29,6 +33,311 @@ class Currency(Enum):
     EUR = "EUR"
     KZT = "KZT"
     CNY = "CNY"
+
+
+class TransactionType(Enum):
+    TRANSFER = "transfer"
+
+
+class TransactionStatus(Enum):
+    PENDING = "pending"
+    DELAYED = "delayed"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True)
+class Transaction:
+    type: TransactionType
+    amount: float
+    currency: Currency
+    sender_account_id: str
+    receiver_account_id: str
+    priority: int = 0
+    max_attempts: int = 3
+    scheduled_at: datetime | None = None
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    fee: float = 0.0
+    status: TransactionStatus = TransactionStatus.PENDING
+    failure_reason: str | None = None
+    created_at: datetime = field(default_factory=datetime.now)
+    processed_at: datetime | None = None
+    updated_at: datetime = field(default_factory=datetime.now)
+    attempt: int = 0
+
+    def mark_processing(self, now: datetime | None = None) -> None:
+        self.status = TransactionStatus.PROCESSING
+        self.updated_at = now or datetime.now()
+
+    def mark_completed(self, now: datetime | None = None) -> None:
+        completed_at = now or datetime.now()
+        self.status = TransactionStatus.COMPLETED
+        self.processed_at = completed_at
+        self.updated_at = completed_at
+        self.failure_reason = None
+
+    def mark_failed(self, reason: str, now: datetime | None = None) -> None:
+        failed_at = now or datetime.now()
+        self.status = TransactionStatus.FAILED
+        self.failure_reason = reason
+        self.processed_at = failed_at
+        self.updated_at = failed_at
+
+    def mark_cancelled(self, reason: str = "Cancelled by user", now: datetime | None = None) -> None:
+        cancelled_at = now or datetime.now()
+        self.status = TransactionStatus.CANCELLED
+        self.failure_reason = reason
+        self.processed_at = cancelled_at
+        self.updated_at = cancelled_at
+
+    def mark_delayed(self, scheduled_at: datetime, now: datetime | None = None) -> None:
+        self.status = TransactionStatus.DELAYED
+        self.scheduled_at = scheduled_at
+        self.updated_at = now or datetime.now()
+
+    def mark_pending(self, now: datetime | None = None) -> None:
+        self.status = TransactionStatus.PENDING
+        self.updated_at = now or datetime.now()
+
+
+class TransactionQueue:
+    def __init__(self):
+        self._sequence = 0
+        self._ready_heap: list[tuple[int, datetime, int, str]] = []
+        self._delayed: dict[str, Transaction] = {}
+        self._all: dict[str, Transaction] = {}
+
+    def _push_ready(self, transaction: Transaction) -> None:
+        self._sequence += 1
+        heapq.heappush(
+            self._ready_heap,
+            (-transaction.priority, transaction.created_at, self._sequence, transaction.id),
+        )
+
+    def add(self, transaction: Transaction, now: datetime | None = None) -> None:
+        current_time = now or datetime.now()
+        self._all[transaction.id] = transaction
+
+        if transaction.scheduled_at and transaction.scheduled_at > current_time:
+            transaction.mark_delayed(transaction.scheduled_at, current_time)
+            self._delayed[transaction.id] = transaction
+            return
+
+        transaction.mark_pending(current_time)
+        self._push_ready(transaction)
+
+    def cancel(self, transaction_id: str, now: datetime | None = None) -> bool:
+        transaction = self._all.get(transaction_id)
+        if transaction is None:
+            return False
+        if transaction.status in (TransactionStatus.COMPLETED, TransactionStatus.FAILED):
+            return False
+
+        self._delayed.pop(transaction_id, None)
+        transaction.mark_cancelled(now=now)
+        return True
+
+    def get_ready(self, now: datetime | None = None) -> list[Transaction]:
+        current_time = now or datetime.now()
+        moved: list[Transaction] = []
+
+        ready_ids = [
+            transaction_id
+            for transaction_id, transaction in self._delayed.items()
+            if transaction.scheduled_at is not None and transaction.scheduled_at <= current_time
+        ]
+        for transaction_id in ready_ids:
+            transaction = self._delayed.pop(transaction_id)
+            transaction.mark_pending(current_time)
+            self._push_ready(transaction)
+            moved.append(transaction)
+        return moved
+
+    def pop_next(self, now: datetime | None = None) -> Transaction | None:
+        self.get_ready(now=now)
+        while self._ready_heap:
+            _, _, _, transaction_id = heapq.heappop(self._ready_heap)
+            transaction = self._all.get(transaction_id)
+            if transaction is None:
+                continue
+            if transaction.status != TransactionStatus.PENDING:
+                continue
+            return transaction
+        return None
+
+    def requeue(self, transaction: Transaction, delay_seconds: int = 0, now: datetime | None = None) -> None:
+        current_time = now or datetime.now()
+        if delay_seconds > 0:
+            transaction.mark_delayed(
+                scheduled_at=current_time + timedelta(seconds=delay_seconds),
+                now=current_time,
+            )
+            self._delayed[transaction.id] = transaction
+            return
+
+        transaction.mark_pending(current_time)
+        self._push_ready(transaction)
+
+    def get(self, transaction_id: str) -> Transaction | None:
+        return self._all.get(transaction_id)
+
+
+class TransactionProcessor:
+    def __init__(
+        self,
+        bank: "Bank",
+        queue: TransactionQueue,
+        external_transfer_fee_rate: float = 0.02,
+        retry_delay_seconds: int = 0,
+        now_provider: Callable[[], datetime] | None = None,
+    ):
+        self.bank = bank
+        self.queue = queue
+        self.external_transfer_fee_rate = external_transfer_fee_rate
+        self.retry_delay_seconds = retry_delay_seconds
+        self.error_log: list[dict[str, Any]] = []
+        self._now_provider = now_provider or datetime.now
+
+    def _now(self) -> datetime:
+        return self._now_provider()
+
+    def create_transfer(
+        self,
+        sender_account_id: str,
+        receiver_account_id: str,
+        amount: float,
+        priority: int = 0,
+        max_attempts: int = 3,
+        scheduled_at: datetime | None = None,
+    ) -> Transaction:
+        sender = self.bank.accounts.get(sender_account_id)
+        if sender is None:
+            raise InvalidOperationError("Счет отправителя не найден.")
+        receiver = self.bank.accounts.get(receiver_account_id)
+        if receiver is None:
+            raise InvalidOperationError("Счет получателя не найден.")
+        if amount <= 0:
+            raise InvalidOperationError("Сумма должна быть больше нуля.")
+
+        transaction = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=amount,
+            currency=sender.currency,
+            sender_account_id=sender_account_id,
+            receiver_account_id=receiver_account_id,
+            priority=priority,
+            max_attempts=max_attempts,
+            scheduled_at=scheduled_at,
+        )
+        self.queue.add(transaction, now=self._now())
+        return transaction
+
+    def _is_external_transfer(self, sender: BankAccount, receiver: BankAccount) -> bool:
+        return sender.currency != receiver.currency
+
+    def _calculate_fee(self, sender: BankAccount, receiver: BankAccount, amount: float) -> float:
+        if self._is_external_transfer(sender, receiver):
+            return amount * self.external_transfer_fee_rate
+        return 0.0
+
+    def _debit_sender(self, sender: BankAccount, total_amount: float) -> None:
+        if isinstance(sender, PremiumAccount):
+            if total_amount <= sender.balance:
+                sender._balance -= total_amount
+                return
+
+            overdraft_required = total_amount - sender.balance
+            if overdraft_required > sender.available_overdraft:
+                raise InsufficientFundsError("Недостаточно средств, включая овердрафт.")
+            sender._balance = 0.0
+            sender.available_overdraft -= overdraft_required
+            return
+
+        if total_amount > sender.balance:
+            raise InsufficientFundsError("Недостаточно средств на счете.")
+        sender._balance -= total_amount
+
+    def _validate_business_rules(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
+        sender.check_account_availability()
+        receiver.check_account_availability()
+
+        if transaction.amount <= 0:
+            raise InvalidOperationError("Сумма должна быть больше нуля.")
+
+        if not isinstance(sender, PremiumAccount) and sender.balance < transaction.amount + transaction.fee:
+            raise InsufficientFundsError("Недостаточно средств на счете.")
+
+    def _execute_transfer(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
+        converted_amount = sender.currency_conversion(receiver.currency, transaction.amount)
+        self._debit_sender(sender, transaction.amount + transaction.fee)
+        receiver.deposit(converted_amount)
+
+    def _handle_failure(
+        self,
+        transaction: Transaction,
+        error: Exception,
+        now: datetime,
+        retryable: bool,
+    ) -> None:
+        transaction.attempt += 1
+        reason = str(error)
+        transaction.failure_reason = reason
+        transaction.updated_at = now
+        self.error_log.append(
+            {
+                "transaction_id": transaction.id,
+                "attempt": transaction.attempt,
+                "error": reason,
+                "timestamp": now.isoformat(timespec="seconds"),
+            }
+        )
+        if retryable and transaction.attempt < transaction.max_attempts:
+            self.queue.requeue(transaction, delay_seconds=self.retry_delay_seconds, now=now)
+            return
+
+        transaction.mark_failed(reason, now=now)
+
+    def process_next(self, now: datetime | None = None) -> Transaction | None:
+        current_time = now or self._now()
+        transaction = self.queue.pop_next(now=current_time)
+        if transaction is None:
+            return None
+
+        transaction.mark_processing(current_time)
+        try:
+            sender = self.bank.accounts.get(transaction.sender_account_id)
+            if sender is None:
+                raise InvalidOperationError("Счет отправителя не найден.")
+            receiver = self.bank.accounts.get(transaction.receiver_account_id)
+            if receiver is None:
+                raise InvalidOperationError("Счет получателя не найден.")
+
+            transaction.fee = self._calculate_fee(sender, receiver, transaction.amount)
+            self._validate_business_rules(transaction, sender, receiver)
+            self._execute_transfer(transaction, sender, receiver)
+            transaction.mark_completed(current_time)
+        except Exception as error:
+            self._handle_failure(
+                transaction=transaction,
+                error=error,
+                now=current_time,
+                retryable=isinstance(error, InsufficientFundsError),
+            )
+        return transaction
+
+    def process_all(self, now: datetime | None = None, limit: int | None = None) -> list[Transaction]:
+        processed: list[Transaction] = []
+        current_time = now or self._now()
+        while True:
+            if limit is not None and len(processed) >= limit:
+                break
+            transaction = self.process_next(now=current_time)
+            if transaction is None:
+                break
+            processed.append(transaction)
+        return processed
 
 
 class UserData(TypedDict, total=False):
@@ -649,3 +958,4 @@ class Bank:
             )
         ranking.sort(key=lambda item: (-item["total_balance"], item["client_id"]))
         return ranking
+

@@ -137,7 +137,9 @@ def test_insufficient_funds_non_premium_and_premium_overdraft() -> None:
     premium_success = processor.create_transfer(ivan_id, oleg_id, 700, max_attempts=1)
     processor.process_next(now=_safe_time())
     assert premium_success.status == TransactionStatus.COMPLETED
-    assert bank.accounts[ivan_id].available_overdraft < bank.accounts[ivan_id].overdraft_limit
+    premium_account = bank.accounts[ivan_id]
+    assert isinstance(premium_account, PremiumAccount)
+    assert premium_account.available_overdraft < premium_account.overdraft_limit
 
 
 def test_external_transfer_fee_applied() -> None:

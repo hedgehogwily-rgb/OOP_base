@@ -51,7 +51,10 @@ def test_close_freeze_and_unfreeze_account() -> None:
 
     bank.close_account(client.id, account_id)
     assert bank.accounts[account_id].account_status == AccountType.CLOSED
-    assert account_id not in client.account_ids
+    assert account_id in client.account_ids
+    assert bank.search_accounts(client_id=client.id, status=AccountType.CLOSED) == [
+        account
+    ]
 
 
 def test_authenticate_locks_after_three_attempts() -> None:

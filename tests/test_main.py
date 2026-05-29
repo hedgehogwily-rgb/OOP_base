@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 from src.models import (
@@ -17,11 +19,11 @@ from src.utils import (
 
 
 @pytest.fixture
-def user():
+def user() -> dict[str, Any]:
     return {"name": "Oleg", "id": 1}
 
 
-def test_deposit(user):
+def test_deposit(user: dict[str, Any]) -> None:
     acc = BankAccount(user)
 
     acc.deposit(1000)
@@ -29,7 +31,7 @@ def test_deposit(user):
     assert acc.balance == 1000
 
 
-def test_withdraw(user):
+def test_withdraw(user: dict[str, Any]) -> None:
     acc = BankAccount(user)
 
     acc.deposit(1000)
@@ -38,7 +40,7 @@ def test_withdraw(user):
     assert acc.balance == 600
 
 
-def test_withdraw_insufficient_funds(user):
+def test_withdraw_insufficient_funds(user: dict[str, Any]) -> None:
     acc = BankAccount(user)
 
     acc.deposit(100)
@@ -47,7 +49,7 @@ def test_withdraw_insufficient_funds(user):
         acc.withdraw(200)
 
 
-def test_transfer(user):
+def test_transfer(user: dict[str, Any]) -> None:
     acc1 = BankAccount(user, currency=Currency.RUB)
     acc2 = BankAccount(user, currency=Currency.RUB)
 
@@ -61,7 +63,7 @@ def test_transfer(user):
 # Тесты для SavingsAccount
 
 
-def test_savings_min_balance(user):
+def test_savings_min_balance(user: dict[str, Any]) -> None:
     acc = SavingsAccount(user, min_balance=500)
 
     acc.deposit(1000)
@@ -70,7 +72,7 @@ def test_savings_min_balance(user):
         acc.withdraw(600)
 
 
-def test_savings_interest(user):
+def test_savings_interest(user: dict[str, Any]) -> None:
     acc = SavingsAccount(user, interest_rate=0.1)
 
     acc.deposit(1000)
@@ -82,7 +84,7 @@ def test_savings_interest(user):
 # Тесты для PremiumAccount
 
 
-def test_premium_overdraft(user):
+def test_premium_overdraft(user: dict[str, Any]) -> None:
     acc = PremiumAccount(user, overdraft_limit=1000)
 
     acc.deposit(500)
@@ -91,7 +93,7 @@ def test_premium_overdraft(user):
     assert acc.available_overdraft < 1000
 
 
-def test_premium_overdraft_limit(user):
+def test_premium_overdraft_limit(user: dict[str, Any]) -> None:
     acc = PremiumAccount(user, overdraft_limit=500)
 
     acc.deposit(100)
@@ -103,7 +105,7 @@ def test_premium_overdraft_limit(user):
 # Тесты для InvestmentAccount
 
 
-def test_buy_investment(user):
+def test_buy_investment(user: dict[str, Any]) -> None:
     acc = InvestmentAccount(user)
 
     acc.deposit(5000)
@@ -113,7 +115,7 @@ def test_buy_investment(user):
     assert acc.balance == 3000
 
 
-def test_sell_investment(user):
+def test_sell_investment(user: dict[str, Any]) -> None:
     acc = InvestmentAccount(user)
 
     acc.deposit(5000)
@@ -125,7 +127,7 @@ def test_sell_investment(user):
     assert acc.balance == 4000
 
 
-def test_project_growth(user):
+def test_project_growth(user: dict[str, Any]) -> None:
     acc = InvestmentAccount(user)
 
     acc.deposit(10000)
@@ -136,34 +138,34 @@ def test_project_growth(user):
     assert projection["stocks"] == 5500
 
 
-def test_invalid_account_status_type(user):
+def test_invalid_account_status_type(user: dict[str, Any]) -> None:
     with pytest.raises(InvalidOperationError):
         BankAccount(user, account_status="frozen")  # type: ignore[arg-type]
 
 
-def test_unique_index_is_short_uuid(user):
+def test_unique_index_is_short_uuid(user: dict[str, Any]) -> None:
     acc = BankAccount(user)
     assert len(acc.unique_index) == 8
 
 
-def test_invalid_user_data_empty_dict():
+def test_invalid_user_data_empty_dict() -> None:
     with pytest.raises(InvalidOperationError):
         BankAccount({})
 
 
-def test_invalid_user_data_name_type():
+def test_invalid_user_data_name_type() -> None:
     with pytest.raises(InvalidOperationError):
-        BankAccount({"name": 123, "id": 1})  # type: ignore[dict-item]
+        BankAccount({"name": 123, "id": 1})  # type: ignore[typeddict-item]
 
 
-def test_investment_withdraw_checks_frozen_status_first(user):
+def test_investment_withdraw_checks_frozen_status_first(user: dict[str, Any]) -> None:
     acc = InvestmentAccount(user, account_status=AccountType.FROZEN)
 
     with pytest.raises(AccountFrozenError):
         acc.withdraw(100)
 
 
-def test_investment_withdraw_checks_closed_status_first(user):
+def test_investment_withdraw_checks_closed_status_first(user: dict[str, Any]) -> None:
     acc = InvestmentAccount(user, account_status=AccountType.CLOSED)
 
     with pytest.raises(AccountClosedError):

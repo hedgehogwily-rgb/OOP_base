@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-import uuid
 import heapq
+import uuid
+from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, TypedDict
+from typing import Any, TypedDict
 
 from src.utils import (
     AccountClosedError,
     AccountFrozenError,
     InsufficientFundsError,
     InvalidOperationError,
+    QuietHoursError,
 )
 
 
@@ -24,7 +26,7 @@ class AccountType(Enum):
 
 class ClientStatus(str, Enum):
     ACTIVE = "active"
-    LOCKED = "locked"   
+    LOCKED = "locked"
 
 
 class Currency(Enum):
@@ -103,7 +105,7 @@ class Transaction:
 
 
 class TransactionQueue:
-    def __init__(self):
+    def __init__(self) -> None:
         self._sequence = 0
         self._ready_heap: list[tuple[int, datetime, int, str]] = []
         self._delayed: dict[str, Transaction] = {}
@@ -187,12 +189,12 @@ class TransactionQueue:
 class TransactionProcessor:
     def __init__(
         self,
-        bank: "Bank",
+        bank: Bank,
         queue: TransactionQueue,
         external_transfer_fee_rate: float = 0.02,
         retry_delay_seconds: int = 0,
         now_provider: Callable[[], datetime] | None = None,
-    ):
+    ) -> None:
         self.bank = bank
         self.queue = queue
         self.external_transfer_fee_rate = external_transfer_fee_rate
@@ -242,36 +244,25 @@ class TransactionProcessor:
             return amount * self.external_transfer_fee_rate
         return 0.0
 
-    def _debit_sender(self, sender: BankAccount, total_amount: float) -> None:
-        if isinstance(sender, PremiumAccount):
-            if total_amount <= sender.balance:
-                sender._balance -= total_amount
-                return
-
-            overdraft_required = total_amount - sender.balance
-            if overdraft_required > sender.available_overdraft:
-                raise InsufficientFundsError("Недостаточно средств, включая овердрафт.")
-            sender._balance = 0.0
-            sender.available_overdraft -= overdraft_required
-            return
-
-        if total_amount > sender.balance:
-            raise InsufficientFundsError("Недостаточно средств на счете.")
-        sender._balance -= total_amount
-
-    def _validate_business_rules(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
+    def _validate_business_rules(
+        self,
+        transaction: Transaction,
+        sender: BankAccount,
+        receiver: BankAccount,
+        now: datetime,
+    ) -> None:
         sender.check_account_availability()
         receiver.check_account_availability()
 
         if transaction.amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        if not isinstance(sender, PremiumAccount) and sender.balance < transaction.amount + transaction.fee:
-            raise InsufficientFundsError("Недостаточно средств на счете.")
+        if self.bank.is_quiet_hours(now):
+            raise QuietHoursError()
 
     def _execute_transfer(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
         converted_amount = sender.currency_conversion(receiver.currency, transaction.amount)
-        self._debit_sender(sender, transaction.amount + transaction.fee)
+        sender.withdraw(transaction.amount + transaction.fee)
         receiver.deposit(converted_amount)
 
     def _handle_failure(
@@ -315,9 +306,15 @@ class TransactionProcessor:
                 raise InvalidOperationError("Счет получателя не найден.")
 
             transaction.fee = self._calculate_fee(sender, receiver, transaction.amount)
-            self._validate_business_rules(transaction, sender, receiver)
+            self._validate_business_rules(transaction, sender, receiver, current_time)
             self._execute_transfer(transaction, sender, receiver)
             transaction.mark_completed(current_time)
+        except QuietHoursError:
+            delay = self.bank.seconds_until_open_hours(current_time)
+            self.queue.requeue(transaction, delay_seconds=delay, now=current_time)
+            return transaction
+        except InvalidOperationError as error:
+            self._handle_failure(transaction, error, current_time, retryable=False)
         except Exception as error:
             self._handle_failure(
                 transaction=transaction,
@@ -379,7 +376,7 @@ class BankAccount(AbstractAccount):
         unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
-    ):
+    ) -> None:
         self.unique_index = unique_index if unique_index else uuid.uuid4().hex[:8]
         self.user_data = self._validate_user_data(user_data)
         self._balance = 0.0
@@ -442,20 +439,17 @@ class BankAccount(AbstractAccount):
 
         self._balance -= amount
 
-    def transfer(self, counterparty: "BankAccount", amount: float) -> None:
+    def transfer(self, counterparty: BankAccount, amount: float) -> None:
         self.check_account_availability()
         counterparty.check_account_availability()
 
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        if amount > self._balance:
-            raise InsufficientFundsError("Недостаточно средств.")
-
         converted_amount = self.currency_conversion(counterparty.currency, amount)
 
+        self.withdraw(amount)
         counterparty.deposit(converted_amount)
-        self._balance -= amount
 
     def get_account_info(self) -> dict[str, Any]:
         return {
@@ -520,7 +514,7 @@ class SavingsAccount(BankAccount):
         account_status: AccountType = AccountType.ACTIVE,
         interest_rate: float = 0.02,
         min_balance: float = 100.0,
-    ):
+    ) -> None:
         super().__init__(user_data, unique_index, currency, account_status)
         self.interest_rate = interest_rate
         self.min_balance = min_balance
@@ -571,12 +565,12 @@ class PremiumAccount(BankAccount):
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
         overdraft_limit: float = 1000.0,
-        commission_rate: float = 0.1,
-    ):
+        commission: float = 10.0,
+    ) -> None:
         super().__init__(user_data, unique_index, currency, account_status)
         self.overdraft_limit = overdraft_limit
         self.available_overdraft = overdraft_limit
-        self.commission_rate = commission_rate
+        self.commission = commission
 
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
@@ -584,7 +578,7 @@ class PremiumAccount(BankAccount):
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        total_amount = amount + (amount * self.commission_rate)
+        total_amount = amount + self.commission
 
         if total_amount <= self._balance:
             self._balance -= total_amount
@@ -595,7 +589,7 @@ class PremiumAccount(BankAccount):
         if needed_overdraft > self.available_overdraft:
             raise InsufficientFundsError("Недостаточно средств, включая овердрафт.")
 
-        self._balance = 0
+        self._balance = 0.0
         self.available_overdraft -= needed_overdraft
 
     def deposit(self, amount: float) -> None:
@@ -623,7 +617,7 @@ class PremiumAccount(BankAccount):
                 "account_type": "PremiumAccount",
                 "overdraft_limit": self.overdraft_limit,
                 "available_overdraft": self.available_overdraft,
-                "commission_rate": self.commission_rate,
+                "commission": self.commission,
             }
         )
         return base_info
@@ -633,7 +627,7 @@ class PremiumAccount(BankAccount):
         str_info += (
             f"\nОвердрафт лимит: {self.overdraft_limit} {self.currency.value}\n"
             f"Доступный овердрафт: {self.available_overdraft} {self.currency.value}\n"
-            f"Комиссия: {self.commission_rate * 100}%"
+            f"Комиссия: {self.commission} {self.currency.value}"
         )
         return str_info
 
@@ -645,7 +639,7 @@ class InvestmentAccount(BankAccount):
         unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
-    ):
+    ) -> None:
         super().__init__(user_data, unique_index, currency, account_status)
         self.investment_portfolio: InvestmentPortfolio = {
             "stocks": 0.0,
@@ -727,7 +721,7 @@ class Client:
         age: int,
         contacts: list[str] | None = None,
         status: ClientStatus = ClientStatus.ACTIVE,
-    ):
+    ) -> None:
         self.name = self._validate_non_empty_str(name, "name")
         self.surname = self._validate_non_empty_str(surname, "surname")
         if not isinstance(id, int):
@@ -798,7 +792,7 @@ class Bank:
         self,
         clients: list[Client] | None = None,
         now_provider: Callable[[], datetime] | None = None,
-    ):
+    ) -> None:
         self.clients: dict[int, Client] = {}
         self.accounts: dict[str, BankAccount] = {}
         self.failed_auth_attempts: dict[int, int] = {}
@@ -817,14 +811,14 @@ class Bank:
             }
         )
 
-    def _is_quiet_hours(self) -> bool:
-        current_hour = self._now_provider().hour
+    def is_quiet_hours(self, now: datetime | None = None) -> bool:
+        current_hour = (now or self._now_provider()).hour
         return 0 <= current_hour < 5
 
     def _ensure_allowed_operation_time(self, client_id: int) -> None:
-        if self._is_quiet_hours():
+        if self.is_quiet_hours():
             self._mark_suspicious_action(client_id, "operation_during_quiet_hours")
-            raise InvalidOperationError("Операции запрещены с 00:00 до 05:00.")
+            raise QuietHoursError()
 
     def _get_client(self, client_id: int) -> Client:
         client = self.clients.get(client_id)
@@ -888,7 +882,6 @@ class Bank:
             raise InvalidOperationError("Счет не принадлежит клиенту.")
 
         account.close_account()
-        client.remove_account(account_id)
 
     def freeze_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
@@ -947,6 +940,7 @@ class Bank:
                 self.accounts[acc_id].balance
                 for acc_id in client.account_ids
                 if acc_id in self.accounts
+                and self.accounts[acc_id].account_status == AccountType.ACTIVE
             )
             ranking.append(
                 {
@@ -958,4 +952,44 @@ class Bank:
             )
         ranking.sort(key=lambda item: (-item["total_balance"], item["client_id"]))
         return ranking
+
+    def deposit(self, client_id: int, account_id: str, amount: float) -> None:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        account = self._get_account(account_id)
+        self._ensure_owned(client, account_id, "deposit_to_foreign_account_attempt")
+        account.deposit(amount)
+
+    def withdraw(self, client_id: int, account_id: str, amount: float) -> None:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        account = self._get_account(account_id)
+        self._ensure_owned(client, account_id, "withdraw_from_foreign_account_attempt")
+        account.withdraw(amount)
+
+    def transfer(
+        self,
+        client_id: int,
+        sender_account_id: str,
+        receiver_account_id: str,
+        amount: float,
+    ) -> None:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        sender = self._get_account(sender_account_id)
+        receiver = self._get_account(receiver_account_id)
+        self._ensure_owned(client, sender_account_id, "transfer_from_foreign_account_attempt")
+        sender.transfer(receiver, amount)
+
+    def _ensure_owned(self, client: Client, account_id: str, reason: str) -> None:
+        if account_id not in client.account_ids:
+            self._mark_suspicious_action(client.id, reason)
+            raise InvalidOperationError("Счет не принадлежит клиенту.")
+
+    def seconds_until_open_hours(self, now: datetime | None = None) -> int:
+        current = now or self._now_provider()
+        if not self.is_quiet_hours(current):
+            return 0
+        open_at = current.replace(hour=5, minute=0, second=0, microsecond=0)
+        return max(int((open_at - current).total_seconds()), 1)
 

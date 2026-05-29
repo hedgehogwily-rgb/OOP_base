@@ -1,7 +1,7 @@
 class DomainError(Exception):
     default_message = "Произошла ошибка."
 
-    def __init__(self, message: str | None = None):
+    def __init__(self, message: str | None = None) -> None:
         message = message or self.default_message
         super().__init__(message)
 
@@ -20,3 +20,7 @@ class AccountClosedError(DomainError):
 
 class InvalidOperationError(DomainError):
     default_message = "Недопустимая операция."
+
+
+class QuietHoursError(InvalidOperationError):
+    default_message = "Операции запрещены с 00:00 до 05:00."

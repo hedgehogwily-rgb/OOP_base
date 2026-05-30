@@ -260,6 +260,11 @@ class TransactionProcessor:
         if self.bank.is_quiet_hours(now):
             raise QuietHoursError()
 
+        if sender.balance < 0 and not isinstance(sender, PremiumAccount):
+            raise InvalidOperationError(
+                "Переводы при отрицательном балансе разрешены только для премиум-счетов."
+            )
+
     def _execute_transfer(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
         converted_amount = sender.currency_conversion(receiver.currency, transaction.amount)
         sender.withdraw(transaction.amount + transaction.fee)
@@ -569,8 +574,15 @@ class PremiumAccount(BankAccount):
     ) -> None:
         super().__init__(user_data, unique_index, currency, account_status)
         self.overdraft_limit = overdraft_limit
-        self.available_overdraft = overdraft_limit
         self.commission = commission
+
+    @property
+    def overdraft_used(self) -> float:
+        return -self._balance if self._balance < 0 else 0.0
+
+    @property
+    def available_overdraft(self) -> float:
+        return self.overdraft_limit - self.overdraft_used
 
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
@@ -578,19 +590,12 @@ class PremiumAccount(BankAccount):
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        total_amount = amount + self.commission
+        new_balance = self._balance - (amount + self.commission)
 
-        if total_amount <= self._balance:
-            self._balance -= total_amount
-            return
-
-        needed_overdraft = total_amount - self._balance
-
-        if needed_overdraft > self.available_overdraft:
+        if new_balance < -self.overdraft_limit:
             raise InsufficientFundsError("Недостаточно средств, включая овердрафт.")
 
-        self._balance = 0.0
-        self.available_overdraft -= needed_overdraft
+        self._balance = new_balance
 
     def deposit(self, amount: float) -> None:
         self.check_account_availability()
@@ -598,17 +603,7 @@ class PremiumAccount(BankAccount):
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        debt = self.overdraft_limit - self.available_overdraft
-
-        if debt > 0:
-            if amount >= debt:
-                amount -= debt
-                self.available_overdraft = self.overdraft_limit
-                self._balance += amount
-            else:
-                self.available_overdraft += amount
-        else:
-            self._balance += amount
+        self._balance += amount
 
     def get_account_info(self) -> dict[str, Any]:
         base_info = super().get_account_info()
@@ -616,6 +611,7 @@ class PremiumAccount(BankAccount):
             {
                 "account_type": "PremiumAccount",
                 "overdraft_limit": self.overdraft_limit,
+                "overdraft_used": self.overdraft_used,
                 "available_overdraft": self.available_overdraft,
                 "commission": self.commission,
             }
@@ -626,6 +622,7 @@ class PremiumAccount(BankAccount):
         str_info = super().__str__()
         str_info += (
             f"\nОвердрафт лимит: {self.overdraft_limit} {self.currency.value}\n"
+            f"Использовано овердрафта: {self.overdraft_used} {self.currency.value}\n"
             f"Доступный овердрафт: {self.available_overdraft} {self.currency.value}\n"
             f"Комиссия: {self.commission} {self.currency.value}"
         )

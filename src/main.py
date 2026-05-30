@@ -12,13 +12,17 @@ from src.models import (
 
 
 def run_day4_demo() -> None:
-    bank = Bank(now_provider=lambda: datetime(2026, 1, 1, 10, 0, 0))
+    def fixed_now() -> datetime:
+        return datetime(2026, 1, 1, 10, 0, 0)
+
+    bank = Bank(now_provider=fixed_now)
     queue = TransactionQueue()
     processor = TransactionProcessor(
         bank=bank,
         queue=queue,
         external_transfer_fee_rate=0.03,
         retry_delay_seconds=0,
+        now_provider=fixed_now,
     )
 
     oleg = Client("Oleg", "Ezhikov", 1, 28, contacts=["+7-900-000-00-01"])

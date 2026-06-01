@@ -37,6 +37,9 @@ class Currency(Enum):
     CNY = "CNY"
 
 
+BASE_CURRENCY = Currency.RUB
+
+
 class TransactionType(Enum):
     TRANSFER = "transfer"
 
@@ -258,6 +261,19 @@ class TransactionProcessor:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
         if self.bank.is_quiet_hours(now):
+            self.error_log.append(
+                {
+                    "transaction_id": transaction.id,
+                    "attempt": transaction.attempt,
+                    "error": "Операция запрещена в тихие часы.",
+                    "timestamp": now.isoformat(timespec="seconds"),
+                }
+            )
+            owner = self.bank.find_account_owner(transaction.sender_account_id)
+            if owner is not None:
+                self.bank._mark_suspicious_action(
+                    owner.id, "transaction_during_quiet_hours"
+                )
             raise QuietHoursError()
 
         if sender.balance < 0 and not isinstance(sender, PremiumAccount):
@@ -267,7 +283,7 @@ class TransactionProcessor:
 
     def _execute_transfer(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
         converted_amount = sender.currency_conversion(receiver.currency, transaction.amount)
-        sender.withdraw(transaction.amount + transaction.fee)
+        sender.witйhdraw(transaction.amount + transaction.fee)
         receiver.deposit(converted_amount)
 
     def _handle_failure(
@@ -686,8 +702,11 @@ class InvestmentAccount(BankAccount):
 
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
-        # Прямые снятия запрещены, вывод средств должен происходить через продажу активов.
-        raise InvalidOperationError("Прямые снятия с инвестиционного счета запрещены.")
+        if amount <= 0:
+            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        if amount > self._balance:
+            raise InsufficientFundsError("Недостаточно денежного баланса. Продайте активы.")
+        self._balance -= amount
 
     def get_account_info(self) -> dict[str, Any]:
         base_info = super().get_account_info()
@@ -829,6 +848,12 @@ class Bank:
             raise InvalidOperationError("Счет не найден.")
         return account
 
+    def find_account_owner(self, account_id: str) -> Client | None:
+        for client in self.clients.values():
+            if account_id in client.account_ids:
+                return client
+        return None
+
     def add_client(self, client: Client) -> None:
         if client.id in self.clients:
             raise InvalidOperationError("Клиент с таким ID уже существует.")
@@ -923,18 +948,22 @@ class Bank:
             result.append(account)
         return result
 
-    def get_total_balance(self) -> float:
+    def get_total_balance(self, currency: Currency = BASE_CURRENCY) -> float:
         total = 0.0
         for account in self.accounts.values():
             if account.account_status == AccountType.ACTIVE:
-                total += account.balance
+                total += account.currency_conversion(currency, account.balance)
         return total
 
-    def get_clients_ranking(self) -> list[dict[str, Any]]:
+    def get_clients_ranking(
+        self, currency: Currency = BASE_CURRENCY
+    ) -> list[dict[str, Any]]:
         ranking: list[dict[str, Any]] = []
         for client in self.clients.values():
             balance = sum(
-                self.accounts[acc_id].balance
+                self.accounts[acc_id].currency_conversion(
+                    currency, self.accounts[acc_id].balance
+                )
                 for acc_id in client.account_ids
                 if acc_id in self.accounts
                 and self.accounts[acc_id].account_status == AccountType.ACTIVE
@@ -945,6 +974,7 @@ class Bank:
                     "name": client.name,
                     "surname": client.surname,
                     "total_balance": balance,
+                    "currency": currency.value,
                 }
             )
         ranking.sort(key=lambda item: (-item["total_balance"], item["client_id"]))

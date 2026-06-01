@@ -17,6 +17,10 @@ def _safe_time() -> datetime:
     return datetime(2026, 1, 1, 10, 0, 0)
 
 
+def _quiet_time() -> datetime:
+    return datetime(2026, 1, 1, 2, 0, 0)
+
+
 def _client(client_id: int, name: str) -> Client:
     return Client(
         name=name,
@@ -115,6 +119,28 @@ def test_cancel_transaction_before_processing() -> None:
     assert queue.cancel(transaction.id, now=_safe_time()) is True
     assert processor.process_next(now=_safe_time()) is None
     assert transaction.status == TransactionStatus.CANCELLED
+
+
+def test_quiet_hours_transaction_logged_and_deferred() -> None:
+    bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
+    bank.accounts[oleg_id].deposit(1000)
+    quiet_now = _quiet_time()
+    transaction = processor.create_transfer(oleg_id, ivan_id, 100)
+
+    result = processor.process_next(now=quiet_now)
+
+    assert result is transaction
+    assert transaction.status == TransactionStatus.DELAYED
+    assert transaction.attempt == 0
+    assert len(processor.error_log) == 1
+    assert processor.error_log[0]["transaction_id"] == transaction.id
+    assert processor.error_log[0]["attempt"] == 0
+    assert "тихие часы" in processor.error_log[0]["error"].lower()
+    assert any(
+        action["reason"] == "transaction_during_quiet_hours"
+        and action["client_id"] == 1
+        for action in bank.suspicious_actions
+    )
 
 
 def test_frozen_account_rejected() -> None:

@@ -283,7 +283,7 @@ class TransactionProcessor:
 
     def _execute_transfer(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
         converted_amount = sender.currency_conversion(receiver.currency, transaction.amount)
-        sender.witйhdraw(transaction.amount + transaction.fee)
+        sender.withdraw(transaction.amount + transaction.fee)
         receiver.deposit(converted_amount)
 
     def _handle_failure(

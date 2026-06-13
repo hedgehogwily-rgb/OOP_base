@@ -81,6 +81,15 @@ class RiskFinding:
 
 
 @dataclass(slots=True)
+class RiskAssessment:
+    level: RiskLevel
+    reasons: list[str]
+    core_level: RiskLevel
+    core_reasons: list[str]
+    is_quiet_hours: bool
+
+
+@dataclass(slots=True)
 class AuditEvent:
     id: str
     timestamp: datetime
@@ -143,7 +152,9 @@ class Transaction:
         self.processed_at = failed_at
         self.updated_at = failed_at
 
-    def mark_cancelled(self, reason: str = "Cancelled by user", now: datetime | None = None) -> None:
+    def mark_cancelled(
+        self, reason: str = "Cancelled by user", now: datetime | None = None
+    ) -> None:
         cancelled_at = now or datetime.now()
         self.status = TransactionStatus.CANCELLED
         self.failure_reason = reason
@@ -171,7 +182,12 @@ class TransactionQueue:
         self._sequence += 1
         heapq.heappush(
             self._ready_heap,
-            (-transaction.priority, transaction.created_at, self._sequence, transaction.id),
+            (
+                -transaction.priority,
+                transaction.created_at,
+                self._sequence,
+                transaction.id,
+            ),
         )
 
     def add(self, transaction: Transaction, now: datetime | None = None) -> None:
@@ -190,7 +206,10 @@ class TransactionQueue:
         transaction = self._all.get(transaction_id)
         if transaction is None:
             return False
-        if transaction.status in (TransactionStatus.COMPLETED, TransactionStatus.FAILED):
+        if transaction.status in (
+            TransactionStatus.COMPLETED,
+            TransactionStatus.FAILED,
+        ):
             return False
 
         self._delayed.pop(transaction_id, None)
@@ -204,7 +223,8 @@ class TransactionQueue:
         ready_ids = [
             transaction_id
             for transaction_id, transaction in self._delayed.items()
-            if transaction.scheduled_at is not None and transaction.scheduled_at <= current_time
+            if transaction.scheduled_at is not None
+            and transaction.scheduled_at <= current_time
         ]
         for transaction_id in ready_ids:
             transaction = self._delayed.pop(transaction_id)
@@ -225,7 +245,12 @@ class TransactionQueue:
             return transaction
         return None
 
-    def requeue(self, transaction: Transaction, delay_seconds: int = 0, now: datetime | None = None) -> None:
+    def requeue(
+        self,
+        transaction: Transaction,
+        delay_seconds: int = 0,
+        now: datetime | None = None,
+    ) -> None:
         current_time = now or datetime.now()
         if delay_seconds > 0:
             transaction.mark_delayed(
@@ -323,7 +348,9 @@ class TransactionProcessor:
     def _is_external_transfer(self, sender: BankAccount, receiver: BankAccount) -> bool:
         return sender.currency != receiver.currency
 
-    def _calculate_fee(self, sender: BankAccount, receiver: BankAccount, amount: float) -> float:
+    def _calculate_fee(
+        self, sender: BankAccount, receiver: BankAccount, amount: float
+    ) -> float:
         if self._is_external_transfer(sender, receiver):
             return amount * self.external_transfer_fee_rate
         return 0.0
@@ -341,29 +368,17 @@ class TransactionProcessor:
         if transaction.amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        if self.bank.is_quiet_hours(now):
-            self.error_log.append(
-                {
-                    "transaction_id": transaction.id,
-                    "attempt": transaction.attempt,
-                    "error": "Операция запрещена в тихие часы.",
-                    "timestamp": now.isoformat(timespec="seconds"),
-                }
-            )
-            owner = self.bank.find_account_owner(transaction.sender_account_id)
-            if owner is not None:
-                self.bank._mark_suspicious_action(
-                    owner.id, "transaction_during_quiet_hours"
-                )
-            raise QuietHoursError()
-
         if sender.balance < 0 and not isinstance(sender, PremiumAccount):
             raise InvalidOperationError(
                 "Переводы при отрицательном балансе разрешены только для премиум-счетов."
             )
 
-    def _execute_transfer(self, transaction: Transaction, sender: BankAccount, receiver: BankAccount) -> None:
-        converted_amount = sender.currency_conversion(receiver.currency, transaction.amount)
+    def _execute_transfer(
+        self, transaction: Transaction, sender: BankAccount, receiver: BankAccount
+    ) -> None:
+        converted_amount = sender.currency_conversion(
+            receiver.currency, transaction.amount
+        )
         sender.withdraw(transaction.amount + transaction.fee)
         receiver.deposit(converted_amount)
 
@@ -396,7 +411,9 @@ class TransactionProcessor:
         )
 
         if retryable and transaction.attempt < transaction.max_attempts:
-            self.queue.requeue(transaction, delay_seconds=self.retry_delay_seconds, now=now)
+            self.queue.requeue(
+                transaction, delay_seconds=self.retry_delay_seconds, now=now
+            )
             return
 
         transaction.mark_failed(reason, now=now)
@@ -419,40 +436,56 @@ class TransactionProcessor:
             transaction.fee = self._calculate_fee(sender, receiver, transaction.amount)
             self._validate_business_rules(transaction, sender, receiver, current_time)
 
-            risk_finding = self.risk_analyzer.analyze_transaction(transaction, sender, current_time)
+            assessment = self.risk_analyzer.analyze_transaction(
+                transaction, sender, current_time
+            )
 
-            if risk_finding.level != RiskLevel.LOW:
+            if assessment.level != RiskLevel.LOW:
                 self._record_audit(
                     transaction=transaction,
-                    level=audit_level_from_risk(risk_finding.level),
+                    level=audit_level_from_risk(assessment.level),
                     event_type="risk_detected",
                     message="Риск-анализ транзакции",
                     now=current_time,
-                    metadata={"reasons": risk_finding.reasons},
+                    metadata={"reasons": assessment.reasons},
                 )
 
-            if risk_finding.level == RiskLevel.HIGH:
+            if assessment.core_level == RiskLevel.HIGH:
                 self._record_audit(
                     transaction=transaction,
                     level=AuditLevel.HIGH,
                     event_type="transaction_blocked",
                     message="Операция заблокирована риск-анализом",
                     now=current_time,
-                    metadata={"reasons": risk_finding.reasons},
+                    metadata={"reasons": assessment.core_reasons},
                 )
                 transaction.mark_failed(
                     "Операция заблокирована риск-анализом: "
-                    + ", ".join(risk_finding.reasons),
+                    + ", ".join(assessment.core_reasons),
                     now=current_time,
                 )
                 return transaction
 
+            if assessment.is_quiet_hours:
+                self.error_log.append(
+                    {
+                        "transaction_id": transaction.id,
+                        "attempt": transaction.attempt,
+                        "error": "Операция запрещена в тихие часы.",
+                        "timestamp": current_time.isoformat(timespec="seconds"),
+                    }
+                )
+                owner = self.bank.find_account_owner(transaction.sender_account_id)
+                if owner is not None:
+                    self.bank._mark_suspicious_action(
+                        owner.id, "transaction_during_quiet_hours"
+                    )
+                delay = self.bank.seconds_until_open_hours(current_time)
+                self.queue.requeue(transaction, delay_seconds=delay, now=current_time)
+                return transaction
+
             self._execute_transfer(transaction, sender, receiver)
             transaction.mark_completed(current_time)
-        except QuietHoursError:
-            delay = self.bank.seconds_until_open_hours(current_time)
-            self.queue.requeue(transaction, delay_seconds=delay, now=current_time)
-            return transaction
         except InvalidOperationError as error:
             self._handle_failure(transaction, error, current_time, retryable=False)
         except Exception as error:
@@ -464,7 +497,9 @@ class TransactionProcessor:
             )
         return transaction
 
-    def process_all(self, now: datetime | None = None, limit: int | None = None) -> list[Transaction]:
+    def process_all(
+        self, now: datetime | None = None, limit: int | None = None
+    ) -> list[Transaction]:
         processed: list[Transaction] = []
         current_time = now or self._now()
         while True:
@@ -534,7 +569,9 @@ class BankAccount(AbstractAccount):
             )
 
     @staticmethod
-    def _validate_user_data(user_data: UserData | dict[str, Any]) -> UserData | dict[str, Any]:
+    def _validate_user_data(
+        user_data: UserData | dict[str, Any],
+    ) -> UserData | dict[str, Any]:
         if not isinstance(user_data, dict):
             raise InvalidOperationError(
                 "Неверный формат user_data. Ожидается словарь с данными пользователя."
@@ -824,7 +861,9 @@ class InvestmentAccount(BankAccount):
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
         if amount > self._balance:
-            raise InsufficientFundsError("Недостаточно денежного баланса. Продайте активы.")
+            raise InsufficientFundsError(
+                "Недостаточно денежного баланса. Продайте активы."
+            )
         self._balance -= amount
 
     def get_account_info(self) -> dict[str, Any]:
@@ -871,7 +910,9 @@ class Client:
     @staticmethod
     def _validate_non_empty_str(value: str, field_name: str) -> str:
         if not isinstance(value, str) or not value.strip():
-            raise InvalidOperationError(f"Поле '{field_name}' должно быть непустой строкой.")
+            raise InvalidOperationError(
+                f"Поле '{field_name}' должно быть непустой строкой."
+            )
         return value.strip()
 
     @staticmethod
@@ -1003,7 +1044,9 @@ class Bank:
         client = self._get_client(client_id)
 
         if client.status != ClientStatus.ACTIVE:
-            raise InvalidOperationError("Открытие счета доступно только активному клиенту.")
+            raise InvalidOperationError(
+                "Открытие счета доступно только активному клиенту."
+            )
 
         account_id = account.unique_index
         if account_id in self.accounts:
@@ -1067,7 +1110,6 @@ class Bank:
             result.append(account)
         return result
 
-
     def get_total_balance(self, currency: Currency = BASE_CURRENCY) -> float:
         total = 0.0
         for account in self.accounts.values():
@@ -1125,7 +1167,9 @@ class Bank:
         client = self._get_client(client_id)
         sender = self._get_account(sender_account_id)
         receiver = self._get_account(receiver_account_id)
-        self._ensure_owned(client, sender_account_id, "transfer_from_foreign_account_attempt")
+        self._ensure_owned(
+            client, sender_account_id, "transfer_from_foreign_account_attempt"
+        )
         sender.transfer(receiver, amount)
 
     def _ensure_owned(self, client: Client, account_id: str, reason: str) -> None:
@@ -1152,29 +1196,40 @@ class RiskAnalyzer:
         transaction: Transaction,
         sender: BankAccount,
         now: datetime,
-    ) -> RiskFinding:
-        risks = [
-            self._is_large_amount(sender, transaction.amount),
-            self._is_frequent_operations(transaction, now),
-            self._is_new_receiver(transaction.sender_account_id, transaction.receiver_account_id),
-            self._is_operation_during_quiet_hours(now),
-        ]
+    ) -> RiskAssessment:
+        large_amount = self._is_large_amount(sender, transaction.amount)
+        frequent_operations = self._is_frequent_operations(transaction, now)
+        new_receiver = self._is_new_receiver(
+            transaction.sender_account_id,
+            transaction.receiver_account_id,
+        )
+        quiet_hours = self._is_operation_during_quiet_hours(now)
 
-        return RiskFinding(
-            level=max(risk.level for risk in risks),
-            reasons=[
-                reason
-                for risk in risks
-                for reason in risk.reasons
-            ],
+        core_risks = [large_amount, frequent_operations, new_receiver]
+        core_level = max(risk.level for risk in core_risks)
+        core_reasons = [reason for risk in core_risks for reason in risk.reasons]
+        all_risks = [*core_risks, quiet_hours]
+        level = max(risk.level for risk in all_risks)
+        reasons = [reason for risk in all_risks for reason in risk.reasons]
+
+        return RiskAssessment(
+            level=level,
+            reasons=reasons,
+            core_level=core_level,
+            core_reasons=core_reasons,
+            is_quiet_hours=quiet_hours.level != RiskLevel.LOW,
         )
 
     def _is_large_amount(self, sender: BankAccount, amount: float) -> RiskFinding:
         converted_amount = sender.currency_conversion(BASE_CURRENCY, amount)
         if converted_amount > 100_000_000:
-            return RiskFinding(level=RiskLevel.HIGH, reasons=["Большая сумма транзакции"])
+            return RiskFinding(
+                level=RiskLevel.HIGH, reasons=["Большая сумма транзакции"]
+            )
         if converted_amount > 1_000_000:
-            return RiskFinding(level=RiskLevel.MEDIUM, reasons=["Большая сумма транзакции"])
+            return RiskFinding(
+                level=RiskLevel.MEDIUM, reasons=["Большая сумма транзакции"]
+            )
         return RiskFinding(level=RiskLevel.LOW, reasons=[])
 
     def _is_frequent_operations(
@@ -1185,15 +1240,21 @@ class RiskAnalyzer:
         window_start = now - timedelta(minutes=10)
         timestamps = [
             timestamp
-            for timestamp in self.operations_by_sender.get(transaction.sender_account_id, [])
+            for timestamp in self.operations_by_sender.get(
+                transaction.sender_account_id, []
+            )
             if timestamp >= window_start
         ]
         timestamps.append(now)
         self.operations_by_sender[transaction.sender_account_id] = timestamps
         if len(timestamps) > 10:
-            return RiskFinding(RiskLevel.HIGH, ["Частота транзакций превышает 10 за 10 минут"])
+            return RiskFinding(
+                RiskLevel.HIGH, ["Частота транзакций превышает 10 за 10 минут"]
+            )
         if len(timestamps) > 5:
-            return RiskFinding(RiskLevel.MEDIUM, ["Частота транзакций превышает 5 за 10 минут"])
+            return RiskFinding(
+                RiskLevel.MEDIUM, ["Частота транзакций превышает 5 за 10 минут"]
+            )
         return RiskFinding(RiskLevel.LOW, [])
 
     def _is_new_receiver(
@@ -1217,16 +1278,21 @@ class RiskAnalyzer:
 
 class AuditLog:
     def __init__(self, file_path: str | None = None) -> None:
-        self.file_path = file_path or "audit.log"
+        self.file_path = file_path
         self.events: list[AuditEvent] = []
 
     def record_event(self, event: AuditEvent) -> None:
         self.events.append(event)
+        if self.file_path is not None:
+            with open(self.file_path, "a", encoding="utf-8") as file:
+                file.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
 
     def save_to_file(self) -> None:
-        with open(self.file_path, "w", encoding="utf-8") as f:
+        if self.file_path is None:
+            raise InvalidOperationError("Путь к файлу аудита не задан.")
+        with open(self.file_path, "w", encoding="utf-8") as file:
             for event in self.events:
-                f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+                file.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
 
     def filter(
         self,

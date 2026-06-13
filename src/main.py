@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 from src.models import (
+    AuditLog,
     Bank,
     BankAccount,
     Client,
@@ -17,12 +18,14 @@ def run_day4_demo() -> None:
 
     bank = Bank(now_provider=fixed_now)
     queue = TransactionQueue()
+    audit_log = AuditLog(file_path="audit.log")
     processor = TransactionProcessor(
         bank=bank,
         queue=queue,
         external_transfer_fee_rate=0.03,
         retry_delay_seconds=0,
         now_provider=fixed_now,
+        audit_log=audit_log,
     )
 
     oleg = Client("Oleg", "Ezhikov", 1, 28, contacts=["+7-900-000-00-01"])
@@ -92,6 +95,17 @@ def run_day4_demo() -> None:
     print("\nЛог ошибок:")
     for log_row in processor.error_log:
         print(log_row)
+
+    print("\nПодозрительные операции:")
+    for event in audit_log.get_suspicious_operations():
+        print(
+            f"{event.timestamp.isoformat(timespec='seconds')} | "
+            f"{event.event_type} | {event.level.value} | {event.message}"
+        )
+
+    print("\nСтатистика ошибок аудита:")
+    for message, count in audit_log.get_error_statistics().items():
+        print(f"{message}: {count}")
 
 
 if __name__ == "__main__":

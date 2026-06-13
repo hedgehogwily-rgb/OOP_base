@@ -21,6 +21,10 @@ def _safe_time() -> datetime:
     return datetime(2026, 1, 1, 10, 0, 0)
 
 
+def _quiet_time() -> datetime:
+    return datetime(2026, 1, 1, 2, 0, 0)
+
+
 def _client(client_id: int, name: str) -> Client:
     return Client(
         name=name,
@@ -260,3 +264,60 @@ def test_client_risk_profile_via_processor() -> None:
     assert profile["total_events"] >= 2
     assert profile["level_counts"]["high"] >= 2
     assert profile["reasons"]["Большая сумма транзакции"] >= 1
+
+
+def test_record_event_appends_to_file_when_path_set(tmp_path: Path) -> None:
+    file_path = tmp_path / "audit.log"
+    log = AuditLog(file_path=str(file_path))
+    log.record_event(
+        _event("a", AuditLevel.HIGH, "transaction_blocked", "blocked", client_id=1)
+    )
+    log.record_event(
+        _event("b", AuditLevel.MEDIUM, "risk_detected", "risk", client_id=1)
+    )
+
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["id"] == "a"
+    assert json.loads(lines[1])["id"] == "b"
+
+
+def test_night_dangerous_transaction_blocked() -> None:
+    bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
+    bank.accounts[oleg_id].deposit(200_000_000)
+
+    transaction = processor.create_transfer(oleg_id, ivan_id, 150_000_000)
+    processor.process_next(now=_quiet_time())
+
+    assert transaction.status == TransactionStatus.FAILED
+    assert bank.accounts[ivan_id].balance == 0
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Большая сумма транзакции" in blocked[0].metadata["reasons"]
+    assert "Операция в тихие часы" not in blocked[0].metadata["reasons"]
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "Большая сумма транзакции" in risk_events[0].metadata["reasons"]
+    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+
+
+def test_night_normal_transaction_deferred_with_risk_detected() -> None:
+    bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
+    bank.accounts[oleg_id].deposit(1000)
+
+    transaction = processor.create_transfer(oleg_id, ivan_id, 100)
+    result = processor.process_next(now=_quiet_time())
+
+    assert result is transaction
+    assert transaction.status == TransactionStatus.DELAYED
+    assert transaction.attempt == 0
+    assert bank.accounts[ivan_id].balance == 0
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+    assert processor.audit_log.filter(event_type="transaction_blocked") == []
+    assert len(processor.error_log) == 1
+    assert "тихие часы" in processor.error_log[0]["error"].lower()

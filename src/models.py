@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import heapq
+import json
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any, TypedDict
 
 from src.utils import (
@@ -44,6 +45,18 @@ class TransactionType(Enum):
     TRANSFER = "transfer"
 
 
+class RiskLevel(IntEnum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+
+class AuditLevel(Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 class TransactionStatus(Enum):
     PENDING = "pending"
     DELAYED = "delayed"
@@ -51,6 +64,46 @@ class TransactionStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+def audit_level_from_risk(risk_level: RiskLevel) -> AuditLevel:
+    if risk_level == RiskLevel.HIGH:
+        return AuditLevel.HIGH
+    if risk_level == RiskLevel.MEDIUM:
+        return AuditLevel.MEDIUM
+    return AuditLevel.LOW
+
+
+@dataclass(slots=True)
+class RiskFinding:
+    level: RiskLevel
+    reasons: list[str]
+
+
+@dataclass(slots=True)
+class AuditEvent:
+    id: str
+    timestamp: datetime
+    level: AuditLevel
+    event_type: str
+    message: str
+    client_id: int | None = None
+    account_id: str | None = None
+    transaction_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "timestamp": self.timestamp.isoformat(timespec="seconds"),
+            "level": self.level.value,
+            "event_type": self.event_type,
+            "message": self.message,
+            "client_id": self.client_id,
+            "account_id": self.account_id,
+            "transaction_id": self.transaction_id,
+            "metadata": self.metadata,
+        }
 
 
 @dataclass(slots=True)
@@ -197,6 +250,8 @@ class TransactionProcessor:
         external_transfer_fee_rate: float = 0.02,
         retry_delay_seconds: int = 0,
         now_provider: Callable[[], datetime] | None = None,
+        risk_analyzer: RiskAnalyzer | None = None,
+        audit_log: AuditLog | None = None,
     ) -> None:
         self.bank = bank
         self.queue = queue
@@ -204,9 +259,35 @@ class TransactionProcessor:
         self.retry_delay_seconds = retry_delay_seconds
         self.error_log: list[dict[str, Any]] = []
         self._now_provider = now_provider or datetime.now
+        self.risk_analyzer = risk_analyzer or RiskAnalyzer(bank)
+        self.audit_log = audit_log or AuditLog()
 
     def _now(self) -> datetime:
         return self._now_provider()
+
+    def _record_audit(
+        self,
+        transaction: Transaction,
+        level: AuditLevel,
+        event_type: str,
+        message: str,
+        now: datetime,
+        metadata: dict[str, Any],
+    ) -> None:
+        owner = self.bank.find_account_owner(transaction.sender_account_id)
+        self.audit_log.record_event(
+            AuditEvent(
+                id=uuid.uuid4().hex[:12],
+                timestamp=now,
+                level=level,
+                event_type=event_type,
+                message=message,
+                client_id=owner.id if owner is not None else None,
+                account_id=transaction.sender_account_id,
+                transaction_id=transaction.id,
+                metadata=metadata,
+            )
+        )
 
     def create_transfer(
         self,
@@ -305,6 +386,15 @@ class TransactionProcessor:
                 "timestamp": now.isoformat(timespec="seconds"),
             }
         )
+        self._record_audit(
+            transaction=transaction,
+            level=AuditLevel.MEDIUM if retryable else AuditLevel.HIGH,
+            event_type="transaction_failed",
+            message=reason,
+            now=now,
+            metadata={"attempt": transaction.attempt, "retryable": retryable},
+        )
+
         if retryable and transaction.attempt < transaction.max_attempts:
             self.queue.requeue(transaction, delay_seconds=self.retry_delay_seconds, now=now)
             return
@@ -328,6 +418,35 @@ class TransactionProcessor:
 
             transaction.fee = self._calculate_fee(sender, receiver, transaction.amount)
             self._validate_business_rules(transaction, sender, receiver, current_time)
+
+            risk_finding = self.risk_analyzer.analyze_transaction(transaction, sender, current_time)
+
+            if risk_finding.level != RiskLevel.LOW:
+                self._record_audit(
+                    transaction=transaction,
+                    level=audit_level_from_risk(risk_finding.level),
+                    event_type="risk_detected",
+                    message="Риск-анализ транзакции",
+                    now=current_time,
+                    metadata={"reasons": risk_finding.reasons},
+                )
+
+            if risk_finding.level == RiskLevel.HIGH:
+                self._record_audit(
+                    transaction=transaction,
+                    level=AuditLevel.HIGH,
+                    event_type="transaction_blocked",
+                    message="Операция заблокирована риск-анализом",
+                    now=current_time,
+                    metadata={"reasons": risk_finding.reasons},
+                )
+                transaction.mark_failed(
+                    "Операция заблокирована риск-анализом: "
+                    + ", ".join(risk_finding.reasons),
+                    now=current_time,
+                )
+                return transaction
+
             self._execute_transfer(transaction, sender, receiver)
             transaction.mark_completed(current_time)
         except QuietHoursError:
@@ -948,6 +1067,7 @@ class Bank:
             result.append(account)
         return result
 
+
     def get_total_balance(self, currency: Currency = BASE_CURRENCY) -> float:
         total = 0.0
         for account in self.accounts.values():
@@ -1020,3 +1140,144 @@ class Bank:
         open_at = current.replace(hour=5, minute=0, second=0, microsecond=0)
         return max(int((open_at - current).total_seconds()), 1)
 
+
+class RiskAnalyzer:
+    def __init__(self, bank: Bank) -> None:
+        self.bank = bank
+        self.seen_receivers_by_sender: dict[str, set[str]] = {}
+        self.operations_by_sender: dict[str, list[datetime]] = {}
+
+    def analyze_transaction(
+        self,
+        transaction: Transaction,
+        sender: BankAccount,
+        now: datetime,
+    ) -> RiskFinding:
+        risks = [
+            self._is_large_amount(sender, transaction.amount),
+            self._is_frequent_operations(transaction, now),
+            self._is_new_receiver(transaction.sender_account_id, transaction.receiver_account_id),
+            self._is_operation_during_quiet_hours(now),
+        ]
+
+        return RiskFinding(
+            level=max(risk.level for risk in risks),
+            reasons=[
+                reason
+                for risk in risks
+                for reason in risk.reasons
+            ],
+        )
+
+    def _is_large_amount(self, sender: BankAccount, amount: float) -> RiskFinding:
+        converted_amount = sender.currency_conversion(BASE_CURRENCY, amount)
+        if converted_amount > 100_000_000:
+            return RiskFinding(level=RiskLevel.HIGH, reasons=["Большая сумма транзакции"])
+        if converted_amount > 1_000_000:
+            return RiskFinding(level=RiskLevel.MEDIUM, reasons=["Большая сумма транзакции"])
+        return RiskFinding(level=RiskLevel.LOW, reasons=[])
+
+    def _is_frequent_operations(
+        self,
+        transaction: Transaction,
+        now: datetime,
+    ) -> RiskFinding:
+        window_start = now - timedelta(minutes=10)
+        timestamps = [
+            timestamp
+            for timestamp in self.operations_by_sender.get(transaction.sender_account_id, [])
+            if timestamp >= window_start
+        ]
+        timestamps.append(now)
+        self.operations_by_sender[transaction.sender_account_id] = timestamps
+        if len(timestamps) > 10:
+            return RiskFinding(RiskLevel.HIGH, ["Частота транзакций превышает 10 за 10 минут"])
+        if len(timestamps) > 5:
+            return RiskFinding(RiskLevel.MEDIUM, ["Частота транзакций превышает 5 за 10 минут"])
+        return RiskFinding(RiskLevel.LOW, [])
+
+    def _is_new_receiver(
+        self,
+        sender_account_id: str,
+        receiver_account_id: str,
+    ) -> RiskFinding:
+        seen_receivers = self.seen_receivers_by_sender.setdefault(
+            sender_account_id, set()
+        )
+        if receiver_account_id not in seen_receivers:
+            seen_receivers.add(receiver_account_id)
+            return RiskFinding(RiskLevel.MEDIUM, ["Транзакция на новый счет"])
+        return RiskFinding(RiskLevel.LOW, [])
+
+    def _is_operation_during_quiet_hours(self, now: datetime) -> RiskFinding:
+        if self.bank.is_quiet_hours(now):
+            return RiskFinding(RiskLevel.HIGH, ["Операция в тихие часы"])
+        return RiskFinding(RiskLevel.LOW, [])
+
+
+class AuditLog:
+    def __init__(self, file_path: str | None = None) -> None:
+        self.file_path = file_path or "audit.log"
+        self.events: list[AuditEvent] = []
+
+    def record_event(self, event: AuditEvent) -> None:
+        self.events.append(event)
+
+    def save_to_file(self) -> None:
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            for event in self.events:
+                f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+
+    def filter(
+        self,
+        level: AuditLevel | None = None,
+        client_id: int | None = None,
+        event_type: str | None = None,
+    ) -> list[AuditEvent]:
+        result: list[AuditEvent] = []
+        for event in self.events:
+            if level is not None and event.level != level:
+                continue
+            if client_id is not None and event.client_id != client_id:
+                continue
+            if event_type is not None and event.event_type != event_type:
+                continue
+            result.append(event)
+        return result
+
+    def get_suspicious_operations(self) -> list[AuditEvent]:
+        return [
+            event
+            for event in self.events
+            if event.level in (AuditLevel.MEDIUM, AuditLevel.HIGH)
+        ]
+
+    def get_client_risk_profile(self, client_id: int) -> dict[str, Any]:
+        events = self.filter(client_id=client_id)
+        level_counts = {level.value: 0 for level in AuditLevel}
+        event_type_counts: dict[str, int] = {}
+        reason_counts: dict[str, int] = {}
+
+        for event in events:
+            level_counts[event.level.value] += 1
+            event_type_counts[event.event_type] = (
+                event_type_counts.get(event.event_type, 0) + 1
+            )
+            for reason in event.metadata.get("reasons", []):
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        return {
+            "client_id": client_id,
+            "total_events": len(events),
+            "level_counts": level_counts,
+            "event_type_counts": event_type_counts,
+            "reasons": reason_counts,
+        }
+
+    def get_error_statistics(self) -> dict[str, int]:
+        stats: dict[str, int] = {}
+        for event in self.events:
+            if event.event_type not in ("transaction_failed", "transaction_blocked"):
+                continue
+            stats[event.message] = stats.get(event.message, 0) + 1
+        return stats

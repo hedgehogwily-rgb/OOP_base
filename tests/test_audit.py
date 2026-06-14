@@ -321,3 +321,21 @@ def test_night_normal_transaction_deferred_with_risk_detected() -> None:
     assert processor.audit_log.filter(event_type="transaction_blocked") == []
     assert len(processor.error_log) == 1
     assert "тихие часы" in processor.error_log[0]["error"].lower()
+
+
+def test_blocked_transaction_does_not_consume_new_receiver() -> None:
+    bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
+    bank.accounts[oleg_id].deposit(200_000_000)
+
+    blocked_tx = processor.create_transfer(oleg_id, ivan_id, 150_000_000)
+    processor.process_next(now=_safe_time())
+    assert blocked_tx.status == TransactionStatus.FAILED
+
+    normal_tx = processor.create_transfer(oleg_id, ivan_id, 200)
+    processor.process_next(now=_safe_time())
+    assert normal_tx.status == TransactionStatus.COMPLETED
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 2
+    assert "Транзакция на новый счет" in risk_events[0].metadata["reasons"]
+    assert "Транзакция на новый счет" in risk_events[1].metadata["reasons"]

@@ -486,6 +486,7 @@ class TransactionProcessor:
 
             self._execute_transfer(transaction, sender, receiver)
             transaction.mark_completed(current_time)
+            self.risk_analyzer.register_transaction(transaction, current_time)
         except InvalidOperationError as error:
             self._handle_failure(transaction, error, current_time, retryable=False)
         except Exception as error:
@@ -1002,6 +1003,11 @@ class Bank:
             raise InvalidOperationError("Клиент не найден.")
         return client
 
+    def _ensure_client_active(self, client: Client) -> None:
+        if client.status == ClientStatus.LOCKED:
+            self._mark_suspicious_action(client.id, "operation_for_locked_client")
+            raise InvalidOperationError("Клиент заблокирован.")
+
     def _get_account(self, account_id: str) -> BankAccount:
         account = self.accounts.get(account_id)
         if account is None:
@@ -1059,6 +1065,7 @@ class Bank:
     def close_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
         client = self._get_client(client_id)
+        self._ensure_client_active(client)
         account = self._get_account(account_id)
 
         if account_id not in client.account_ids:
@@ -1070,6 +1077,7 @@ class Bank:
     def freeze_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
         client = self._get_client(client_id)
+        self._ensure_client_active(client)
         account = self._get_account(account_id)
         if account_id not in client.account_ids:
             self._mark_suspicious_action(client_id, "freeze_foreign_account_attempt")
@@ -1079,6 +1087,7 @@ class Bank:
     def unfreeze_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
         client = self._get_client(client_id)
+        self._ensure_client_active(client)
         account = self._get_account(account_id)
         if account_id not in client.account_ids:
             self._mark_suspicious_action(client_id, "unfreeze_foreign_account_attempt")
@@ -1145,6 +1154,7 @@ class Bank:
     def deposit(self, client_id: int, account_id: str, amount: float) -> None:
         self._ensure_allowed_operation_time(client_id)
         client = self._get_client(client_id)
+        self._ensure_client_active(client)
         account = self._get_account(account_id)
         self._ensure_owned(client, account_id, "deposit_to_foreign_account_attempt")
         account.deposit(amount)
@@ -1152,6 +1162,7 @@ class Bank:
     def withdraw(self, client_id: int, account_id: str, amount: float) -> None:
         self._ensure_allowed_operation_time(client_id)
         client = self._get_client(client_id)
+        self._ensure_client_active(client)
         account = self._get_account(account_id)
         self._ensure_owned(client, account_id, "withdraw_from_foreign_account_attempt")
         account.withdraw(amount)
@@ -1165,6 +1176,7 @@ class Bank:
     ) -> None:
         self._ensure_allowed_operation_time(client_id)
         client = self._get_client(client_id)
+        self._ensure_client_active(client)
         sender = self._get_account(sender_account_id)
         receiver = self._get_account(receiver_account_id)
         self._ensure_owned(
@@ -1220,6 +1232,23 @@ class RiskAnalyzer:
             is_quiet_hours=quiet_hours.level != RiskLevel.LOW,
         )
 
+    def register_transaction(self, transaction: Transaction, now: datetime) -> None:
+        seen_receivers = self.seen_receivers_by_sender.setdefault(
+            transaction.sender_account_id, set()
+        )
+        seen_receivers.add(transaction.receiver_account_id)
+
+        window_start = now - timedelta(minutes=10)
+        timestamps = [
+            timestamp
+            for timestamp in self.operations_by_sender.get(
+                transaction.sender_account_id, []
+            )
+            if timestamp >= window_start
+        ]
+        timestamps.append(now)
+        self.operations_by_sender[transaction.sender_account_id] = timestamps
+
     def _is_large_amount(self, sender: BankAccount, amount: float) -> RiskFinding:
         converted_amount = sender.currency_conversion(BASE_CURRENCY, amount)
         if converted_amount > 100_000_000:
@@ -1238,20 +1267,21 @@ class RiskAnalyzer:
         now: datetime,
     ) -> RiskFinding:
         window_start = now - timedelta(minutes=10)
-        timestamps = [
-            timestamp
-            for timestamp in self.operations_by_sender.get(
-                transaction.sender_account_id, []
-            )
-            if timestamp >= window_start
-        ]
-        timestamps.append(now)
-        self.operations_by_sender[transaction.sender_account_id] = timestamps
-        if len(timestamps) > 10:
+        recent_count = len(
+            [
+                timestamp
+                for timestamp in self.operations_by_sender.get(
+                    transaction.sender_account_id, []
+                )
+                if timestamp >= window_start
+            ]
+        )
+        count = recent_count + 1
+        if count > 10:
             return RiskFinding(
                 RiskLevel.HIGH, ["Частота транзакций превышает 10 за 10 минут"]
             )
-        if len(timestamps) > 5:
+        if count > 5:
             return RiskFinding(
                 RiskLevel.MEDIUM, ["Частота транзакций превышает 5 за 10 минут"]
             )
@@ -1262,11 +1292,8 @@ class RiskAnalyzer:
         sender_account_id: str,
         receiver_account_id: str,
     ) -> RiskFinding:
-        seen_receivers = self.seen_receivers_by_sender.setdefault(
-            sender_account_id, set()
-        )
+        seen_receivers = self.seen_receivers_by_sender.get(sender_account_id, set())
         if receiver_account_id not in seen_receivers:
-            seen_receivers.add(receiver_account_id)
             return RiskFinding(RiskLevel.MEDIUM, ["Транзакция на новый счет"])
         return RiskFinding(RiskLevel.LOW, [])
 

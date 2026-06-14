@@ -71,6 +71,47 @@ def test_authenticate_locks_after_three_attempts() -> None:
         bank.authenticate_client(client.id, is_credentials_valid=True)
 
 
+def test_locked_client_cannot_operate() -> None:
+    bank = Bank(now_provider=_safe_time)
+    sender = _create_client(1, "Oleg")
+    receiver = _create_client(2, "John")
+    bank.add_client(sender)
+    bank.add_client(receiver)
+
+    sender_account_id = bank.open_account(
+        sender.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    receiver_account_id = bank.open_account(
+        receiver.id,
+        BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.accounts[sender_account_id].deposit(1000)
+
+    for _ in range(3):
+        bank.authenticate_client(sender.id, is_credentials_valid=False)
+    assert sender.status == "locked"
+
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        bank.deposit(sender.id, sender_account_id, 100)
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        bank.withdraw(sender.id, sender_account_id, 100)
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        bank.transfer(sender.id, sender_account_id, receiver_account_id, 100)
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        bank.freeze_account(sender.id, sender_account_id)
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        bank.unfreeze_account(sender.id, sender_account_id)
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        bank.close_account(sender.id, sender_account_id)
+
+    assert any(
+        action["reason"] == "operation_for_locked_client"
+        and action["client_id"] == sender.id
+        for action in bank.suspicious_actions
+    )
+
+
 def test_open_account_forbidden_during_quiet_hours() -> None:
     bank = Bank(now_provider=_quiet_time)
     client = _create_client(1, "Oleg")
@@ -90,8 +131,12 @@ def test_total_balance_and_clients_ranking() -> None:
     bank.add_client(oleg)
     bank.add_client(john)
 
-    oleg_account = BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB)
-    john_account = BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB)
+    oleg_account = BankAccount(
+        {"name": "Oleg", "surname": "Test"}, currency=Currency.RUB
+    )
+    john_account = BankAccount(
+        {"name": "John", "surname": "Test"}, currency=Currency.RUB
+    )
     oleg_id = bank.open_account(oleg.id, oleg_account)
     john_id = bank.open_account(john.id, john_account)
 

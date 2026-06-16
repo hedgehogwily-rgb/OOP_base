@@ -295,7 +295,7 @@ def test_night_dangerous_transaction_blocked() -> None:
     blocked = processor.audit_log.filter(event_type="transaction_blocked")
     assert len(blocked) == 1
     assert "Большая сумма транзакции" in blocked[0].metadata["reasons"]
-    assert "Операция в тихие часы" not in blocked[0].metadata["reasons"]
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
 
     risk_events = processor.audit_log.filter(event_type="risk_detected")
     assert len(risk_events) == 1
@@ -303,7 +303,7 @@ def test_night_dangerous_transaction_blocked() -> None:
     assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
 
 
-def test_night_normal_transaction_deferred_with_risk_detected() -> None:
+def test_night_normal_transaction_blocked_with_risk_detected() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
     bank.accounts[oleg_id].deposit(1000)
 
@@ -311,16 +311,16 @@ def test_night_normal_transaction_deferred_with_risk_detected() -> None:
     result = processor.process_next(now=_quiet_time())
 
     assert result is transaction
-    assert transaction.status == TransactionStatus.DELAYED
-    assert transaction.attempt == 0
+    assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
 
     risk_events = processor.audit_log.filter(event_type="risk_detected")
     assert len(risk_events) == 1
     assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
-    assert processor.audit_log.filter(event_type="transaction_blocked") == []
-    assert len(processor.error_log) == 1
-    assert "тихие часы" in processor.error_log[0]["error"].lower()
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
 
 
 def test_blocked_transaction_does_not_consume_new_receiver() -> None:
@@ -339,3 +339,40 @@ def test_blocked_transaction_does_not_consume_new_receiver() -> None:
     assert len(risk_events) == 2
     assert "Транзакция на новый счет" in risk_events[0].metadata["reasons"]
     assert "Транзакция на новый счет" in risk_events[1].metadata["reasons"]
+
+
+def test_locked_client_transfer_blocked_in_processor() -> None:
+    bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
+    bank.accounts[oleg_id].deposit(1000)
+
+    for _ in range(3):
+        bank.authenticate_client(1, is_credentials_valid=False)
+    assert bank.clients[1].status == "locked"
+
+    transaction = processor.create_transfer(oleg_id, ivan_id, 100)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.FAILED
+    assert "заблокирован" in (transaction.failure_reason or "").lower()
+    assert any(
+        action["reason"] == "operation_for_locked_client" and action["client_id"] == 1
+        for action in bank.suspicious_actions
+    )
+
+
+def test_frequent_operations_count_failed_attempts() -> None:
+    bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
+    now = _safe_time()
+
+    for _ in range(6):
+        tx = processor.create_transfer(oleg_id, ivan_id, 100, max_attempts=1)
+        processor.process_next(now=now)
+        assert tx.status == TransactionStatus.FAILED
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    frequency_events = [
+        event
+        for event in risk_events
+        if "Частота транзакций превышает 5 за 10 минут" in event.metadata["reasons"]
+    ]
+    assert len(frequency_events) >= 1

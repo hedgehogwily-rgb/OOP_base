@@ -31,7 +31,9 @@ def _client(client_id: int, name: str) -> Client:
     )
 
 
-def _setup_bank_and_processor() -> tuple[Bank, TransactionQueue, TransactionProcessor, str, str, str]:
+def _setup_bank_and_processor() -> tuple[
+    Bank, TransactionQueue, TransactionProcessor, str, str, str
+]:
     bank = Bank(now_provider=_safe_time)
     queue = TransactionQueue()
     processor = TransactionProcessor(
@@ -121,7 +123,7 @@ def test_cancel_transaction_before_processing() -> None:
     assert transaction.status == TransactionStatus.CANCELLED
 
 
-def test_quiet_hours_transaction_logged_and_deferred() -> None:
+def test_quiet_hours_transaction_blocked() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
     bank.accounts[oleg_id].deposit(1000)
     quiet_now = _quiet_time()
@@ -130,17 +132,12 @@ def test_quiet_hours_transaction_logged_and_deferred() -> None:
     result = processor.process_next(now=quiet_now)
 
     assert result is transaction
-    assert transaction.status == TransactionStatus.DELAYED
-    assert transaction.attempt == 0
-    assert len(processor.error_log) == 1
-    assert processor.error_log[0]["transaction_id"] == transaction.id
-    assert processor.error_log[0]["attempt"] == 0
-    assert "тихие часы" in processor.error_log[0]["error"].lower()
-    assert any(
-        action["reason"] == "transaction_during_quiet_hours"
-        and action["client_id"] == 1
-        for action in bank.suspicious_actions
-    )
+    assert transaction.status == TransactionStatus.FAILED
+    assert bank.accounts[ivan_id].balance == 0
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
 
 
 def test_frozen_account_rejected() -> None:
@@ -206,7 +203,9 @@ def test_process_ten_transactions_flow() -> None:
         processor.create_transfer(oleg_id, john_id, 80, priority=10),
         processor.create_transfer(ivan_id, oleg_id, 500, priority=7),
         processor.create_transfer(oleg_id, ivan_id, 180, priority=6),
-        processor.create_transfer(oleg_id, ivan_id, 40, priority=5, scheduled_at=base + timedelta(minutes=10)),
+        processor.create_transfer(
+            oleg_id, ivan_id, 40, priority=5, scheduled_at=base + timedelta(minutes=10)
+        ),
         processor.create_transfer(john_id, oleg_id, 30, priority=4),
         processor.create_transfer(oleg_id, john_id, 60, priority=3),
         processor.create_transfer(ivan_id, john_id, 20, priority=2),

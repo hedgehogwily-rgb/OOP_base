@@ -84,9 +84,6 @@ class RiskFinding:
 class RiskAssessment:
     level: RiskLevel
     reasons: list[str]
-    core_level: RiskLevel
-    core_reasons: list[str]
-    is_quiet_hours: bool
 
 
 @dataclass(slots=True)
@@ -365,6 +362,11 @@ class TransactionProcessor:
         sender.check_account_availability()
         receiver.check_account_availability()
 
+        owner = self.bank.find_account_owner(transaction.sender_account_id)
+        if owner is not None and owner.status == ClientStatus.LOCKED:
+            self.bank._mark_suspicious_action(owner.id, "operation_for_locked_client")
+            raise InvalidOperationError("Клиент заблокирован.")
+
         if transaction.amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
@@ -433,6 +435,7 @@ class TransactionProcessor:
             if receiver is None:
                 raise InvalidOperationError("Счет получателя не найден.")
 
+            self.risk_analyzer.register_frequency(transaction, current_time)
             transaction.fee = self._calculate_fee(sender, receiver, transaction.amount)
             self._validate_business_rules(transaction, sender, receiver, current_time)
 
@@ -450,43 +453,25 @@ class TransactionProcessor:
                     metadata={"reasons": assessment.reasons},
                 )
 
-            if assessment.core_level == RiskLevel.HIGH:
+            if assessment.level == RiskLevel.HIGH:
                 self._record_audit(
                     transaction=transaction,
                     level=AuditLevel.HIGH,
                     event_type="transaction_blocked",
                     message="Операция заблокирована риск-анализом",
                     now=current_time,
-                    metadata={"reasons": assessment.core_reasons},
+                    metadata={"reasons": assessment.reasons},
                 )
                 transaction.mark_failed(
                     "Операция заблокирована риск-анализом: "
-                    + ", ".join(assessment.core_reasons),
+                    + ", ".join(assessment.reasons),
                     now=current_time,
                 )
                 return transaction
 
-            if assessment.is_quiet_hours:
-                self.error_log.append(
-                    {
-                        "transaction_id": transaction.id,
-                        "attempt": transaction.attempt,
-                        "error": "Операция запрещена в тихие часы.",
-                        "timestamp": current_time.isoformat(timespec="seconds"),
-                    }
-                )
-                owner = self.bank.find_account_owner(transaction.sender_account_id)
-                if owner is not None:
-                    self.bank._mark_suspicious_action(
-                        owner.id, "transaction_during_quiet_hours"
-                    )
-                delay = self.bank.seconds_until_open_hours(current_time)
-                self.queue.requeue(transaction, delay_seconds=delay, now=current_time)
-                return transaction
-
             self._execute_transfer(transaction, sender, receiver)
             transaction.mark_completed(current_time)
-            self.risk_analyzer.register_transaction(transaction, current_time)
+            self.risk_analyzer.register_receiver(transaction)
         except InvalidOperationError as error:
             self._handle_failure(transaction, error, current_time, retryable=False)
         except Exception as error:
@@ -1217,27 +1202,13 @@ class RiskAnalyzer:
         )
         quiet_hours = self._is_operation_during_quiet_hours(now)
 
-        core_risks = [large_amount, frequent_operations, new_receiver]
-        core_level = max(risk.level for risk in core_risks)
-        core_reasons = [reason for risk in core_risks for reason in risk.reasons]
-        all_risks = [*core_risks, quiet_hours]
+        all_risks = [large_amount, frequent_operations, new_receiver, quiet_hours]
         level = max(risk.level for risk in all_risks)
         reasons = [reason for risk in all_risks for reason in risk.reasons]
 
-        return RiskAssessment(
-            level=level,
-            reasons=reasons,
-            core_level=core_level,
-            core_reasons=core_reasons,
-            is_quiet_hours=quiet_hours.level != RiskLevel.LOW,
-        )
+        return RiskAssessment(level=level, reasons=reasons)
 
-    def register_transaction(self, transaction: Transaction, now: datetime) -> None:
-        seen_receivers = self.seen_receivers_by_sender.setdefault(
-            transaction.sender_account_id, set()
-        )
-        seen_receivers.add(transaction.receiver_account_id)
-
+    def register_frequency(self, transaction: Transaction, now: datetime) -> None:
         window_start = now - timedelta(minutes=10)
         timestamps = [
             timestamp
@@ -1248,6 +1219,12 @@ class RiskAnalyzer:
         ]
         timestamps.append(now)
         self.operations_by_sender[transaction.sender_account_id] = timestamps
+
+    def register_receiver(self, transaction: Transaction) -> None:
+        seen_receivers = self.seen_receivers_by_sender.setdefault(
+            transaction.sender_account_id, set()
+        )
+        seen_receivers.add(transaction.receiver_account_id)
 
     def _is_large_amount(self, sender: BankAccount, amount: float) -> RiskFinding:
         converted_amount = sender.currency_conversion(BASE_CURRENCY, amount)
@@ -1267,7 +1244,7 @@ class RiskAnalyzer:
         now: datetime,
     ) -> RiskFinding:
         window_start = now - timedelta(minutes=10)
-        recent_count = len(
+        count = len(
             [
                 timestamp
                 for timestamp in self.operations_by_sender.get(
@@ -1276,7 +1253,6 @@ class RiskAnalyzer:
                 if timestamp >= window_start
             ]
         )
-        count = recent_count + 1
         if count > 10:
             return RiskFinding(
                 RiskLevel.HIGH, ["Частота транзакций превышает 10 за 10 минут"]

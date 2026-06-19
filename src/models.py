@@ -351,9 +351,12 @@ class TransactionProcessor:
     def _calculate_fee(
         self, sender: BankAccount, receiver: BankAccount, amount: float
     ) -> float:
+        fee = 0.0
         if self._is_external_transfer(sender, receiver):
-            return amount * self.external_transfer_fee_rate
-        return 0.0
+            fee += amount * self.external_transfer_fee_rate
+        if isinstance(sender, PremiumAccount):
+            fee += sender.commission
+        return fee
 
     def _validate_business_rules(
         self,
@@ -366,7 +369,7 @@ class TransactionProcessor:
         receiver.check_account_availability()
 
         owner = self.bank.find_account_owner(transaction.sender_account_id)
-        if owner is not None and owner.status == ClientStatus.LOCKED:
+        if owner is not None and owner.status != ClientStatus.ACTIVE:
             self.bank._mark_suspicious_action(owner.id, "operation_for_locked_client")
             raise InvalidOperationError("Клиент заблокирован.")
 
@@ -384,7 +387,11 @@ class TransactionProcessor:
         converted_amount = sender.currency_conversion(
             receiver.currency, transaction.amount
         )
-        sender.withdraw(transaction.amount + transaction.fee)
+        total_debit = transaction.amount + transaction.fee
+        if isinstance(sender, PremiumAccount):
+            sender.withdraw(total_debit, apply_commission=False)
+        else:
+            sender.withdraw(total_debit)
         receiver.deposit(converted_amount)
 
     def _handle_failure(
@@ -745,13 +752,14 @@ class PremiumAccount(BankAccount):
     def available_overdraft(self) -> float:
         return self.overdraft_limit - self.overdraft_used
 
-    def withdraw(self, amount: float) -> None:
+    def withdraw(self, amount: float, *, apply_commission: bool = True) -> None:
         self.check_account_availability()
 
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
-        new_balance = self._balance - (amount + self.commission)
+        debit = amount + (self.commission if apply_commission else 0.0)
+        new_balance = self._balance - debit
 
         if new_balance < -self.overdraft_limit:
             raise InsufficientFundsError("Недостаточно средств, включая овердрафт.")
@@ -860,7 +868,7 @@ class InvestmentAccount(BankAccount):
         base_info.update(
             {
                 "account_type": "InvestmentAccount",
-                "investment_portfolio": self.investment_portfolio,
+                "investment_portfolio": dict(self.investment_portfolio),
             }
         )
         return base_info
@@ -892,6 +900,10 @@ class Client:
         self.id = id
         self.age = age
         self.check_age()
+        if not isinstance(status, ClientStatus):
+            raise InvalidOperationError(
+                "Неверный статус клиента. Ожидается экземпляр класса ClientStatus."
+            )
         self.status = status
         self.contacts = self._validate_contacts(contacts or [])
         self.account_ids: list[str] = []
@@ -992,7 +1004,7 @@ class Bank:
         return client
 
     def _ensure_client_active(self, client: Client) -> None:
-        if client.status == ClientStatus.LOCKED:
+        if client.status != ClientStatus.ACTIVE:
             self._mark_suspicious_action(client.id, "operation_for_locked_client")
             raise InvalidOperationError("Клиент заблокирован.")
 
@@ -1016,7 +1028,7 @@ class Bank:
 
     def authenticate_client(self, client_id: int, is_credentials_valid: bool) -> bool:
         client = self._get_client(client_id)
-        if client.status == ClientStatus.LOCKED:
+        if client.status != ClientStatus.ACTIVE:
             self._mark_suspicious_action(client_id, "auth_attempt_for_locked_client")
             raise InvalidOperationError("Клиент заблокирован.")
 

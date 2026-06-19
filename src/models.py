@@ -263,6 +263,9 @@ class TransactionQueue:
     def get(self, transaction_id: str) -> Transaction | None:
         return self._all.get(transaction_id)
 
+    def all_transactions(self) -> list[Transaction]:
+        return list(self._all.values())
+
 
 class TransactionProcessor:
     def __init__(

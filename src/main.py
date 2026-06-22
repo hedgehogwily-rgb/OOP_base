@@ -16,6 +16,7 @@ from src.models import (
     TransactionProcessor,
     TransactionQueue,
 )
+from src.utils import InvalidOperationError
 
 logger = logging.getLogger(__name__)
 
@@ -134,18 +135,22 @@ def log_wave_summary(wave_name: str, transactions: list[Transaction]) -> None:
 
 def _add_tx(
     processor: TransactionProcessor,
+    bank: Bank,
     all_transactions: list[Transaction],
     sender_id: str,
     receiver_id: str,
     amount: float,
     **kwargs: Any,
 ) -> Transaction:
-    tx = processor.create_transfer(sender_id, receiver_id, amount, **kwargs)
+    owner = bank.find_account_owner(sender_id)
+    if owner is None:
+        raise InvalidOperationError("Владелец счета отправителя не найден.")
+    tx = processor.create_transfer(owner.id, sender_id, receiver_id, amount, **kwargs)
     all_transactions.append(tx)
     return tx
 
 
-def run_day6_demo() -> dict[str, Any]:
+def run_day6_demo(audit_log_path: str | None = None) -> dict[str, Any]:
     _ensure_logging()
     day_time = datetime(2026, 1, 1, 10, 0, 0)
     wave1_time = day_time + timedelta(hours=1)
@@ -158,7 +163,7 @@ def run_day6_demo() -> dict[str, Any]:
 
     bank = Bank(now_provider=fixed_now)
     queue = TransactionQueue()
-    audit_log = AuditLog(file_path="audit.log")
+    audit_log = AuditLog(file_path=audit_log_path)
     processor = TransactionProcessor(
         bank=bank,
         queue=queue,
@@ -181,6 +186,9 @@ def run_day6_demo() -> dict[str, Any]:
     ]
     for client in clients:
         bank.add_client(client)
+
+    for client_id in range(1, 8):
+        bank.authenticate_client(client_id, is_credentials_valid=True)
 
     acc: dict[str, str] = {}
     acc["oleg_rub"] = bank.open_account(
@@ -260,11 +268,14 @@ def run_day6_demo() -> dict[str, Any]:
         ],
         start=1,
     ):
-        _add_tx(processor, all_transactions, sender, receiver, amount, priority=prio)
+        _add_tx(
+            processor, bank, all_transactions, sender, receiver, amount, priority=prio
+        )
 
     # Очередь: отложенные и приоритеты
     delayed_tx = _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["kate_inv"],
         acc["alex_rub"],
@@ -274,6 +285,7 @@ def run_day6_demo() -> dict[str, Any]:
     )
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["oleg_rub"],
         acc["mike_prem"],
@@ -285,6 +297,7 @@ def run_day6_demo() -> dict[str, Any]:
     # Ошибочные (~10)
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["oleg_rub"],
         acc["ivan_prem"],
@@ -294,6 +307,7 @@ def run_day6_demo() -> dict[str, Any]:
     )
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["alex_rub"],
         acc["oleg_rub"],
@@ -303,6 +317,7 @@ def run_day6_demo() -> dict[str, Any]:
     )
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["john_usd"],
         acc["oleg_rub"],
@@ -312,6 +327,7 @@ def run_day6_demo() -> dict[str, Any]:
     )
     cancel_tx = _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["oleg_rub"],
         acc["anna_sav"],
@@ -320,22 +336,10 @@ def run_day6_demo() -> dict[str, Any]:
     )
     queue.cancel(cancel_tx.id, now=day_time)
 
-    # LOCKED-клиент
-    for _ in range(3):
-        bank.authenticate_client(7, is_credentials_valid=False)
-    _add_tx(
-        processor,
-        all_transactions,
-        acc["alex_rub"],
-        acc["oleg_rub"],
-        100,
-        max_attempts=1,
-        priority=7,
-    )
-
     # Подозрительные: крупная сумма
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["oleg_rub"],
         acc["kate_inv"],
@@ -348,6 +352,7 @@ def run_day6_demo() -> dict[str, Any]:
     for _ in range(6):
         _add_tx(
             processor,
+            bank,
             all_transactions,
             acc["alex_rub"],
             acc["ivan_prem"],
@@ -356,9 +361,27 @@ def run_day6_demo() -> dict[str, Any]:
             priority=1,
         )
 
+    # LOCKED-клиент
+    for _ in range(3):
+        bank.authenticate_client(7, is_credentials_valid=False)
+    try:
+        _add_tx(
+            processor,
+            bank,
+            all_transactions,
+            acc["alex_rub"],
+            acc["oleg_rub"],
+            100,
+            max_attempts=1,
+            priority=7,
+        )
+    except InvalidOperationError as error:
+        logger.warning("Перевод от заблокированного клиента отклонён: %s", error)
+
     # Подозрительные: новые получатели (автоматически через первые переводы)
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["oleg_rub"],
         acc["kate_eur"],
@@ -367,6 +390,7 @@ def run_day6_demo() -> dict[str, Any]:
     )
     _add_tx(
         processor,
+        bank,
         all_transactions,
         acc["mike_usd"],
         acc["john_rub"],
@@ -381,7 +405,7 @@ def run_day6_demo() -> dict[str, Any]:
         (acc["mike_prem"], acc["oleg_sav"], 350),
         (acc["kate_inv"], acc["mike_prem"], 500),
     ]:
-        _add_tx(processor, all_transactions, sender, receiver, amount, priority=2)
+        _add_tx(processor, bank, all_transactions, sender, receiver, amount, priority=2)
 
     logger.info("=== День 6: демонстрация банковской системы ===")
     logger.info(
@@ -400,6 +424,7 @@ def run_day6_demo() -> dict[str, Any]:
     night_txs = [
         _add_tx(
             processor,
+            bank,
             all_transactions,
             acc["oleg_rub"],
             acc["ivan_prem"],
@@ -408,6 +433,7 @@ def run_day6_demo() -> dict[str, Any]:
         ),
         _add_tx(
             processor,
+            bank,
             all_transactions,
             acc["anna_sav"],
             acc["mike_prem"],
@@ -416,6 +442,7 @@ def run_day6_demo() -> dict[str, Any]:
         ),
         _add_tx(
             processor,
+            bank,
             all_transactions,
             acc["ivan_prem"],
             acc["oleg_rub"],
@@ -424,6 +451,7 @@ def run_day6_demo() -> dict[str, Any]:
         ),
         _add_tx(
             processor,
+            bank,
             all_transactions,
             acc["mike_prem"],
             acc["kate_inv"],
@@ -432,6 +460,7 @@ def run_day6_demo() -> dict[str, Any]:
         ),
         _add_tx(
             processor,
+            bank,
             all_transactions,
             acc["kate_inv"],
             acc["alex_rub"],
@@ -472,8 +501,9 @@ def run_day6_demo() -> dict[str, Any]:
     for message, count in audit_log.get_error_statistics().items():
         logger.info("  %s: %s", message, count)
 
-    audit_log.save_to_file()
-    logger.info("Аудит сохранён в audit.log")
+    if audit_log_path is not None:
+        audit_log.save_to_file()
+        logger.info("Аудит сохранён в %s", audit_log_path)
 
     return {
         "clients": len(bank.clients),
@@ -488,7 +518,7 @@ def run_day6_demo() -> dict[str, Any]:
     }
 
 
-def run_day4_demo() -> None:
+def run_day4_demo(audit_log_path: str | None = None) -> None:
     _ensure_logging()
 
     def fixed_now() -> datetime:
@@ -496,7 +526,7 @@ def run_day4_demo() -> None:
 
     bank = Bank(now_provider=fixed_now)
     queue = TransactionQueue()
-    audit_log = AuditLog(file_path="audit.log")
+    audit_log = AuditLog(file_path=audit_log_path)
     processor = TransactionProcessor(
         bank=bank,
         queue=queue,
@@ -513,6 +543,9 @@ def run_day4_demo() -> None:
     bank.add_client(john)
     bank.add_client(ivan)
 
+    for client_id in (oleg.id, john.id, ivan.id):
+        bank.authenticate_client(client_id, is_credentials_valid=True)
+
     oleg_account_id = bank.open_account(
         oleg.id,
         BankAccount({"name": "Oleg", "surname": "Ezhikov"}, currency=Currency.RUB),
@@ -526,29 +559,48 @@ def run_day4_demo() -> None:
         PremiumAccount({"name": "Ivan", "surname": "Ivanov"}, currency=Currency.RUB),
     )
 
-    bank.accounts[oleg_account_id].deposit(10_000)
-    bank.accounts[john_account_id].deposit(400)
-    bank.accounts[ivan_account_id].deposit(200)
+    bank.deposit(oleg.id, oleg_account_id, 10_000)
+    bank.deposit(john.id, john_account_id, 400)
+    bank.deposit(ivan.id, ivan_account_id, 200)
     bank.freeze_account(john.id, john_account_id)
 
     now = datetime(2026, 1, 1, 10, 0, 0)
     transactions = [
-        processor.create_transfer(oleg_account_id, ivan_account_id, 1200, priority=5),
-        processor.create_transfer(oleg_account_id, john_account_id, 100, priority=9),
-        processor.create_transfer(ivan_account_id, oleg_account_id, 700, priority=7),
-        processor.create_transfer(john_account_id, oleg_account_id, 50, priority=4),
         processor.create_transfer(
+            oleg.id, oleg_account_id, ivan_account_id, 1200, priority=5
+        ),
+        processor.create_transfer(
+            oleg.id, oleg_account_id, john_account_id, 100, priority=9
+        ),
+        processor.create_transfer(
+            ivan.id, ivan_account_id, oleg_account_id, 700, priority=7
+        ),
+        processor.create_transfer(
+            john.id, john_account_id, oleg_account_id, 50, priority=4
+        ),
+        processor.create_transfer(
+            oleg.id,
             oleg_account_id,
             ivan_account_id,
             200,
             priority=8,
             scheduled_at=now + timedelta(minutes=15),
         ),
-        processor.create_transfer(oleg_account_id, ivan_account_id, 150, priority=3),
-        processor.create_transfer(ivan_account_id, john_account_id, 80, priority=6),
-        processor.create_transfer(oleg_account_id, john_account_id, 60, priority=2),
-        processor.create_transfer(oleg_account_id, ivan_account_id, 90, priority=1),
-        processor.create_transfer(ivan_account_id, oleg_account_id, 1800, priority=10),
+        processor.create_transfer(
+            oleg.id, oleg_account_id, ivan_account_id, 150, priority=3
+        ),
+        processor.create_transfer(
+            ivan.id, ivan_account_id, john_account_id, 80, priority=6
+        ),
+        processor.create_transfer(
+            oleg.id, oleg_account_id, john_account_id, 60, priority=2
+        ),
+        processor.create_transfer(
+            oleg.id, oleg_account_id, ivan_account_id, 90, priority=1
+        ),
+        processor.create_transfer(
+            ivan.id, ivan_account_id, oleg_account_id, 1800, priority=10
+        ),
     ]
 
     queue.cancel(transactions[8].id, now=now)

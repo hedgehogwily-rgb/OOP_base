@@ -2,6 +2,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from src.models import (
     AuditEvent,
     AuditLevel,
@@ -15,6 +17,7 @@ from src.models import (
     TransactionQueue,
     TransactionStatus,
 )
+from src.utils import InvalidOperationError
 
 
 def _safe_time() -> datetime:
@@ -59,7 +62,15 @@ def _setup_bank_and_processor() -> tuple[Bank, TransactionProcessor, str, str]:
         ivan.id,
         PremiumAccount({"name": "Ivan", "surname": "Test"}, currency=Currency.RUB),
     )
+    bank.authenticate_client(oleg.id, is_credentials_valid=True)
+    bank.authenticate_client(ivan.id, is_credentials_valid=True)
     return bank, processor, oleg_id, ivan_id
+
+
+def _fund(bank: Bank, client_id: int, account_id: str, amount: float) -> None:
+    if client_id not in bank.authenticated_clients:
+        bank.authenticate_client(client_id, is_credentials_valid=True)
+    bank.deposit(client_id, account_id, amount)
 
 
 def _event(
@@ -193,9 +204,9 @@ def test_save_to_file_writes_jsonl(tmp_path: Path) -> None:
 
 def test_normal_transfer_succeeds_without_errors() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 200)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 200)
     processor.process_next(now=_safe_time())
 
     assert transaction.status == TransactionStatus.COMPLETED
@@ -204,9 +215,9 @@ def test_normal_transfer_succeeds_without_errors() -> None:
 
 def test_new_receiver_logged_as_suspicious_with_client_id() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
 
-    processor.create_transfer(oleg_id, ivan_id, 200)
+    processor.create_transfer(1, oleg_id, ivan_id, 200)
     processor.process_next(now=_safe_time())
 
     suspicious = processor.audit_log.get_suspicious_operations()
@@ -220,9 +231,9 @@ def test_new_receiver_logged_as_suspicious_with_client_id() -> None:
 
 def test_large_amount_blocked_and_recorded() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(200_000_000)
+    _fund(bank, 1, oleg_id, 200_000_000)
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 150_000_000)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 150_000_000)
     processor.process_next(now=_safe_time())
 
     assert transaction.status == TransactionStatus.FAILED
@@ -240,7 +251,7 @@ def test_large_amount_blocked_and_recorded() -> None:
 def test_failed_transaction_recorded_in_audit() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 500, max_attempts=1)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 500, max_attempts=1)
     processor.process_next(now=_safe_time())
 
     assert transaction.status == TransactionStatus.FAILED
@@ -255,9 +266,9 @@ def test_failed_transaction_recorded_in_audit() -> None:
 
 def test_client_risk_profile_via_processor() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(200_000_000)
+    _fund(bank, 1, oleg_id, 200_000_000)
 
-    processor.create_transfer(oleg_id, ivan_id, 150_000_000)
+    processor.create_transfer(1, oleg_id, ivan_id, 150_000_000)
     processor.process_next(now=_safe_time())
 
     profile = processor.audit_log.get_client_risk_profile(1)
@@ -284,9 +295,9 @@ def test_record_event_appends_to_file_when_path_set(tmp_path: Path) -> None:
 
 def test_night_dangerous_transaction_blocked() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(200_000_000)
+    _fund(bank, 1, oleg_id, 200_000_000)
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 150_000_000)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 150_000_000)
     processor.process_next(now=_quiet_time())
 
     assert transaction.status == TransactionStatus.FAILED
@@ -305,9 +316,9 @@ def test_night_dangerous_transaction_blocked() -> None:
 
 def test_night_normal_transaction_blocked_with_risk_detected() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 100)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 100)
     result = processor.process_next(now=_quiet_time())
 
     assert result is transaction
@@ -325,13 +336,13 @@ def test_night_normal_transaction_blocked_with_risk_detected() -> None:
 
 def test_blocked_transaction_does_not_consume_new_receiver() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(200_000_000)
+    _fund(bank, 1, oleg_id, 200_000_000)
 
-    blocked_tx = processor.create_transfer(oleg_id, ivan_id, 150_000_000)
+    blocked_tx = processor.create_transfer(1, oleg_id, ivan_id, 150_000_000)
     processor.process_next(now=_safe_time())
     assert blocked_tx.status == TransactionStatus.FAILED
 
-    normal_tx = processor.create_transfer(oleg_id, ivan_id, 200)
+    normal_tx = processor.create_transfer(1, oleg_id, ivan_id, 200)
     processor.process_next(now=_safe_time())
     assert normal_tx.status == TransactionStatus.COMPLETED
 
@@ -343,17 +354,15 @@ def test_blocked_transaction_does_not_consume_new_receiver() -> None:
 
 def test_locked_client_transfer_blocked_in_processor() -> None:
     bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
 
     for _ in range(3):
         bank.authenticate_client(1, is_credentials_valid=False)
     assert bank.clients[1].status == "locked"
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 100)
-    processor.process_next(now=_safe_time())
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        processor.create_transfer(1, oleg_id, ivan_id, 100)
 
-    assert transaction.status == TransactionStatus.FAILED
-    assert "заблокирован" in (transaction.failure_reason or "").lower()
     assert any(
         action["reason"] == "operation_for_locked_client" and action["client_id"] == 1
         for action in bank.suspicious_actions
@@ -365,7 +374,7 @@ def test_frequent_operations_count_failed_attempts() -> None:
     now = _safe_time()
 
     for _ in range(6):
-        tx = processor.create_transfer(oleg_id, ivan_id, 100, max_attempts=1)
+        tx = processor.create_transfer(1, oleg_id, ivan_id, 100, max_attempts=1)
         processor.process_next(now=now)
         assert tx.status == TransactionStatus.FAILED
 

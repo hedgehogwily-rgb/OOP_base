@@ -130,6 +130,7 @@ class Transaction:
     processed_at: datetime | None = None
     updated_at: datetime = field(default_factory=datetime.now)
     attempt: int = 0
+    client_id: int | None = None
 
     def mark_processing(self, now: datetime | None = None) -> None:
         self.status = TransactionStatus.PROCESSING
@@ -299,7 +300,10 @@ class TransactionProcessor:
         now: datetime,
         metadata: dict[str, Any],
     ) -> None:
-        owner = self.bank.find_account_owner(transaction.sender_account_id)
+        client_id = transaction.client_id
+        if client_id is None:
+            owner = self.bank.find_account_owner(transaction.sender_account_id)
+            client_id = owner.id if owner is not None else None
         self.audit_log.record_event(
             AuditEvent(
                 id=uuid.uuid4().hex[:12],
@@ -307,7 +311,7 @@ class TransactionProcessor:
                 level=level,
                 event_type=event_type,
                 message=message,
-                client_id=owner.id if owner is not None else None,
+                client_id=client_id,
                 account_id=transaction.sender_account_id,
                 transaction_id=transaction.id,
                 metadata=metadata,
@@ -316,6 +320,7 @@ class TransactionProcessor:
 
     def create_transfer(
         self,
+        client_id: int,
         sender_account_id: str,
         receiver_account_id: str,
         amount: float,
@@ -323,6 +328,9 @@ class TransactionProcessor:
         max_attempts: int = 3,
         scheduled_at: datetime | None = None,
     ) -> Transaction:
+        self.bank.authorize_operation(
+            client_id, sender_account_id, "transfer_from_foreign_account_attempt"
+        )
         sender = self.bank.accounts.get(sender_account_id)
         if sender is None:
             raise InvalidOperationError("Счет отправителя не найден.")
@@ -341,6 +349,7 @@ class TransactionProcessor:
             priority=priority,
             max_attempts=max_attempts,
             scheduled_at=scheduled_at,
+            client_id=client_id,
         )
         self.queue.add(transaction, now=self._now())
         return transaction
@@ -368,10 +377,13 @@ class TransactionProcessor:
         sender.check_account_availability()
         receiver.check_account_availability()
 
-        owner = self.bank.find_account_owner(transaction.sender_account_id)
-        if owner is not None and owner.status != ClientStatus.ACTIVE:
-            self.bank._mark_suspicious_action(owner.id, "operation_for_locked_client")
-            raise InvalidOperationError("Клиент заблокирован.")
+        if transaction.client_id is not None:
+            client = self.bank.clients.get(transaction.client_id)
+            if client is not None and client.status != ClientStatus.ACTIVE:
+                self.bank._mark_suspicious_action(
+                    client.id, "operation_for_locked_client"
+                )
+                raise InvalidOperationError("Клиент заблокирован.")
 
         if transaction.amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
@@ -389,10 +401,10 @@ class TransactionProcessor:
         )
         total_debit = transaction.amount + transaction.fee
         if isinstance(sender, PremiumAccount):
-            sender.withdraw(total_debit, apply_commission=False)
+            sender._withdraw(total_debit, apply_commission=False)
         else:
-            sender.withdraw(total_debit)
-        receiver.deposit(converted_amount)
+            sender._withdraw(total_debit)
+        receiver._deposit(converted_amount)
 
     def _handle_failure(
         self,
@@ -528,11 +540,11 @@ class AbstractAccount(ABC):
         pass
 
     @abstractmethod
-    def deposit(self, amount: float) -> None:
+    def _deposit(self, amount: float) -> None:
         pass
 
     @abstractmethod
-    def withdraw(self, amount: float) -> None:
+    def _withdraw(self, amount: float) -> None:
         pass
 
     @abstractmethod
@@ -593,7 +605,7 @@ class BankAccount(AbstractAccount):
     def balance(self) -> float:
         return self._balance
 
-    def deposit(self, amount: float) -> None:
+    def _deposit(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -601,7 +613,7 @@ class BankAccount(AbstractAccount):
 
         self._balance += amount
 
-    def withdraw(self, amount: float) -> None:
+    def _withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -612,7 +624,7 @@ class BankAccount(AbstractAccount):
 
         self._balance -= amount
 
-    def transfer(self, counterparty: BankAccount, amount: float) -> None:
+    def _transfer(self, counterparty: BankAccount, amount: float) -> None:
         self.check_account_availability()
         counterparty.check_account_availability()
 
@@ -621,8 +633,8 @@ class BankAccount(AbstractAccount):
 
         converted_amount = self.currency_conversion(counterparty.currency, amount)
 
-        self.withdraw(amount)
-        counterparty.deposit(converted_amount)
+        self._withdraw(amount)
+        counterparty._deposit(converted_amount)
 
     def get_account_info(self) -> dict[str, Any]:
         return {
@@ -692,7 +704,7 @@ class SavingsAccount(BankAccount):
         self.interest_rate = interest_rate
         self.min_balance = min_balance
 
-    def withdraw(self, amount: float) -> None:
+    def _withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -703,7 +715,7 @@ class SavingsAccount(BankAccount):
                 "Недостаточно средств для поддержания минимального баланса."
             )
 
-        super().withdraw(amount)
+        super()._withdraw(amount)
 
     def apply_monthly_interest(self) -> None:
         self.check_account_availability()
@@ -752,7 +764,7 @@ class PremiumAccount(BankAccount):
     def available_overdraft(self) -> float:
         return self.overdraft_limit - self.overdraft_used
 
-    def withdraw(self, amount: float, *, apply_commission: bool = True) -> None:
+    def _withdraw(self, amount: float, *, apply_commission: bool = True) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -766,7 +778,7 @@ class PremiumAccount(BankAccount):
 
         self._balance = new_balance
 
-    def deposit(self, amount: float) -> None:
+    def _deposit(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -853,7 +865,7 @@ class InvestmentAccount(BankAccount):
             projected_portfolio[investment_type] = projected_amount
         return projected_portfolio
 
-    def withdraw(self, amount: float) -> None:
+    def _withdraw(self, amount: float) -> None:
         self.check_account_availability()
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
@@ -973,6 +985,7 @@ class Bank:
         self.clients: dict[int, Client] = {}
         self.accounts: dict[str, BankAccount] = {}
         self.failed_auth_attempts: dict[int, int] = {}
+        self.authenticated_clients: set[int] = set()
         self.suspicious_actions: list[dict[str, Any]] = []
         self._now_provider = now_provider or datetime.now
 
@@ -1026,6 +1039,22 @@ class Bank:
         self.clients[client.id] = client
         self.failed_auth_attempts[client.id] = 0
 
+    def _ensure_owned(self, client: Client, account_id: str, reason: str) -> None:
+        if account_id not in client.account_ids:
+            self._mark_suspicious_action(client.id, reason)
+            raise InvalidOperationError("Счет не принадлежит клиенту.")
+
+    def authorize_operation(
+        self, client_id: int, account_id: str, reason: str
+    ) -> Client:
+        self._ensure_allowed_operation_time(client_id)
+        client = self._get_client(client_id)
+        self._ensure_client_active(client)
+        if client_id not in self.authenticated_clients:
+            raise InvalidOperationError("Клиент не аутентифицирован.")
+        self._ensure_owned(client, account_id, reason)
+        return client
+
     def authenticate_client(self, client_id: int, is_credentials_valid: bool) -> bool:
         client = self._get_client(client_id)
         if client.status != ClientStatus.ACTIVE:
@@ -1034,6 +1063,7 @@ class Bank:
 
         if is_credentials_valid:
             self.failed_auth_attempts[client_id] = 0
+            self.authenticated_clients.add(client_id)
             return True
 
         attempts = self.failed_auth_attempts.get(client_id, 0) + 1
@@ -1152,20 +1182,18 @@ class Bank:
         return ranking
 
     def deposit(self, client_id: int, account_id: str, amount: float) -> None:
-        self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
+        self.authorize_operation(
+            client_id, account_id, "deposit_to_foreign_account_attempt"
+        )
         account = self._get_account(account_id)
-        self._ensure_owned(client, account_id, "deposit_to_foreign_account_attempt")
-        account.deposit(amount)
+        account._deposit(amount)
 
     def withdraw(self, client_id: int, account_id: str, amount: float) -> None:
-        self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
+        self.authorize_operation(
+            client_id, account_id, "withdraw_from_foreign_account_attempt"
+        )
         account = self._get_account(account_id)
-        self._ensure_owned(client, account_id, "withdraw_from_foreign_account_attempt")
-        account.withdraw(amount)
+        account._withdraw(amount)
 
     def transfer(
         self,
@@ -1174,20 +1202,12 @@ class Bank:
         receiver_account_id: str,
         amount: float,
     ) -> None:
-        self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
+        self.authorize_operation(
+            client_id, sender_account_id, "transfer_from_foreign_account_attempt"
+        )
         sender = self._get_account(sender_account_id)
         receiver = self._get_account(receiver_account_id)
-        self._ensure_owned(
-            client, sender_account_id, "transfer_from_foreign_account_attempt"
-        )
-        sender.transfer(receiver, amount)
-
-    def _ensure_owned(self, client: Client, account_id: str, reason: str) -> None:
-        if account_id not in client.account_ids:
-            self._mark_suspicious_action(client.id, reason)
-            raise InvalidOperationError("Счет не принадлежит клиенту.")
+        sender._transfer(receiver, amount)
 
     def seconds_until_open_hours(self, now: datetime | None = None) -> int:
         current = now or self._now_provider()

@@ -86,7 +86,8 @@ def test_locked_client_cannot_operate() -> None:
         receiver.id,
         BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB),
     )
-    bank.accounts[sender_account_id].deposit(1000)
+    bank.authenticate_client(sender.id, is_credentials_valid=True)
+    bank.deposit(sender.id, sender_account_id, 1000)
 
     for _ in range(3):
         bank.authenticate_client(sender.id, is_credentials_valid=False)
@@ -140,8 +141,10 @@ def test_total_balance_and_clients_ranking() -> None:
     oleg_id = bank.open_account(oleg.id, oleg_account)
     john_id = bank.open_account(john.id, john_account)
 
-    bank.accounts[oleg_id].deposit(1000)
-    bank.accounts[john_id].deposit(500)
+    bank.authenticate_client(oleg.id, is_credentials_valid=True)
+    bank.authenticate_client(john.id, is_credentials_valid=True)
+    bank.deposit(oleg.id, oleg_id, 1000)
+    bank.deposit(john.id, john_id, 500)
 
     assert bank.get_total_balance() == 1500
     ranking = bank.get_clients_ranking()

@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 
+import pytest
+
 from src.models import (
     AccountType,
     Bank,
@@ -11,6 +13,7 @@ from src.models import (
     TransactionQueue,
     TransactionStatus,
 )
+from src.utils import InvalidOperationError
 
 
 def _safe_time() -> datetime:
@@ -29,6 +32,17 @@ def _client(client_id: int, name: str) -> Client:
         age=25,
         contacts=[f"+7-987-654-32-{client_id:02d}"],
     )
+
+
+def _authenticate_clients(bank: Bank, client_ids: list[int]) -> None:
+    for client_id in client_ids:
+        bank.authenticate_client(client_id, is_credentials_valid=True)
+
+
+def _fund(bank: Bank, client_id: int, account_id: str, amount: float) -> None:
+    if client_id not in bank.authenticated_clients:
+        bank.authenticate_client(client_id, is_credentials_valid=True)
+    bank.deposit(client_id, account_id, amount)
 
 
 def _setup_bank_and_processor() -> tuple[
@@ -63,14 +77,15 @@ def _setup_bank_and_processor() -> tuple[
         ivan.id,
         PremiumAccount({"name": "Ivan", "surname": "Test"}, currency=Currency.RUB),
     )
+    _authenticate_clients(bank, [oleg.id, john.id, ivan.id])
     return bank, queue, processor, oleg_account_id, john_account_id, ivan_account_id
 
 
 def test_successful_transfer_changes_balances() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
 
-    transaction = processor.create_transfer(oleg_id, ivan_id, 200)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 200)
     result = processor.process_next(now=_safe_time())
 
     assert result is transaction
@@ -81,10 +96,10 @@ def test_successful_transfer_changes_balances() -> None:
 
 def test_priority_processing_order() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
 
-    low = processor.create_transfer(oleg_id, ivan_id, 100, priority=1)
-    high = processor.create_transfer(oleg_id, ivan_id, 120, priority=10)
+    low = processor.create_transfer(1, oleg_id, ivan_id, 100, priority=1)
+    high = processor.create_transfer(1, oleg_id, ivan_id, 120, priority=10)
 
     first = processor.process_next(now=_safe_time())
     second = processor.process_next(now=_safe_time())
@@ -95,9 +110,10 @@ def test_priority_processing_order() -> None:
 
 def test_delayed_transaction_processed_only_after_scheduled_time() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(500)
+    _fund(bank, 1, oleg_id, 500)
     base = _safe_time()
     delayed = processor.create_transfer(
+        1,
         oleg_id,
         ivan_id,
         150,
@@ -115,8 +131,8 @@ def test_delayed_transaction_processed_only_after_scheduled_time() -> None:
 
 def test_cancel_transaction_before_processing() -> None:
     bank, queue, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(500)
-    transaction = processor.create_transfer(oleg_id, ivan_id, 150, priority=2)
+    _fund(bank, 1, oleg_id, 500)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 150, priority=2)
 
     assert queue.cancel(transaction.id, now=_safe_time()) is True
     assert processor.process_next(now=_safe_time()) is None
@@ -125,9 +141,9 @@ def test_cancel_transaction_before_processing() -> None:
 
 def test_quiet_hours_transaction_blocked() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
     quiet_now = _quiet_time()
-    transaction = processor.create_transfer(oleg_id, ivan_id, 100)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 100)
 
     result = processor.process_next(now=quiet_now)
 
@@ -142,9 +158,9 @@ def test_quiet_hours_transaction_blocked() -> None:
 
 def test_frozen_account_rejected() -> None:
     bank, _, processor, oleg_id, john_id, _ = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
+    _fund(bank, 1, oleg_id, 1000)
     bank.accounts[john_id].account_status = AccountType.FROZEN
-    transaction = processor.create_transfer(oleg_id, john_id, 50, max_attempts=1)
+    transaction = processor.create_transfer(1, oleg_id, john_id, 50, max_attempts=1)
 
     processor.process_next(now=_safe_time())
     assert transaction.status == TransactionStatus.FAILED
@@ -153,11 +169,13 @@ def test_frozen_account_rejected() -> None:
 
 def test_insufficient_funds_non_premium_and_premium_overdraft() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    non_premium = processor.create_transfer(oleg_id, ivan_id, 100, max_attempts=1)
+    non_premium = processor.create_transfer(1, oleg_id, ivan_id, 100, max_attempts=1)
     processor.process_next(now=_safe_time())
     assert non_premium.status == TransactionStatus.FAILED
 
-    premium_success = processor.create_transfer(ivan_id, oleg_id, 700, max_attempts=1)
+    premium_success = processor.create_transfer(
+        3, ivan_id, oleg_id, 700, max_attempts=1
+    )
     processor.process_next(now=_safe_time())
     assert premium_success.status == TransactionStatus.COMPLETED
     premium_account = bank.accounts[ivan_id]
@@ -165,10 +183,22 @@ def test_insufficient_funds_non_premium_and_premium_overdraft() -> None:
     assert premium_account.available_overdraft < premium_account.overdraft_limit
 
 
+def test_premium_transfer_fee_in_transaction() -> None:
+    bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
+    _fund(bank, 3, ivan_id, 5000)
+
+    transaction = processor.create_transfer(3, ivan_id, oleg_id, 700, max_attempts=1)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.COMPLETED
+    assert transaction.fee == 10.0
+    assert bank.accounts[ivan_id].balance == 5000 - 700 - 10
+
+
 def test_external_transfer_fee_applied() -> None:
     bank, _, processor, oleg_id, john_id, _ = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(1000)
-    transaction = processor.create_transfer(oleg_id, john_id, 100, max_attempts=1)
+    _fund(bank, 1, oleg_id, 1000)
+    transaction = processor.create_transfer(1, oleg_id, john_id, 100, max_attempts=1)
 
     processor.process_next(now=_safe_time())
     assert transaction.status == TransactionStatus.COMPLETED
@@ -178,7 +208,7 @@ def test_external_transfer_fee_applied() -> None:
 
 def test_retry_until_max_attempts_then_fail() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
-    transaction = processor.create_transfer(oleg_id, ivan_id, 200, max_attempts=2)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 200, max_attempts=2)
 
     first = processor.process_next(now=_safe_time())
     second = processor.process_next(now=_safe_time())
@@ -192,25 +222,30 @@ def test_retry_until_max_attempts_then_fail() -> None:
 
 def test_process_ten_transactions_flow() -> None:
     bank, queue, processor, oleg_id, john_id, ivan_id = _setup_bank_and_processor()
-    bank.accounts[oleg_id].deposit(5_000)
-    bank.accounts[john_id].deposit(100)
-    bank.accounts[ivan_id].deposit(50)
+    _fund(bank, 1, oleg_id, 5_000)
+    _fund(bank, 2, john_id, 100)
+    _fund(bank, 3, ivan_id, 50)
     bank.accounts[john_id].account_status = AccountType.FROZEN
 
     base = _safe_time()
     txs = [
-        processor.create_transfer(oleg_id, ivan_id, 200, priority=8),
-        processor.create_transfer(oleg_id, john_id, 80, priority=10),
-        processor.create_transfer(ivan_id, oleg_id, 500, priority=7),
-        processor.create_transfer(oleg_id, ivan_id, 180, priority=6),
+        processor.create_transfer(1, oleg_id, ivan_id, 200, priority=8),
+        processor.create_transfer(1, oleg_id, john_id, 80, priority=10),
+        processor.create_transfer(3, ivan_id, oleg_id, 500, priority=7),
+        processor.create_transfer(1, oleg_id, ivan_id, 180, priority=6),
         processor.create_transfer(
-            oleg_id, ivan_id, 40, priority=5, scheduled_at=base + timedelta(minutes=10)
+            1,
+            oleg_id,
+            ivan_id,
+            40,
+            priority=5,
+            scheduled_at=base + timedelta(minutes=10),
         ),
-        processor.create_transfer(john_id, oleg_id, 30, priority=4),
-        processor.create_transfer(oleg_id, john_id, 60, priority=3),
-        processor.create_transfer(ivan_id, john_id, 20, priority=2),
-        processor.create_transfer(oleg_id, ivan_id, 70, priority=1),
-        processor.create_transfer(ivan_id, oleg_id, 1200, priority=9),
+        processor.create_transfer(2, john_id, oleg_id, 30, priority=4),
+        processor.create_transfer(1, oleg_id, john_id, 60, priority=3),
+        processor.create_transfer(3, ivan_id, john_id, 20, priority=2),
+        processor.create_transfer(1, oleg_id, ivan_id, 70, priority=1),
+        processor.create_transfer(3, ivan_id, oleg_id, 1200, priority=9),
     ]
 
     queue.cancel(txs[8].id, now=base)
@@ -222,3 +257,37 @@ def test_process_ten_transactions_flow() -> None:
     assert any(tx.status == TransactionStatus.COMPLETED for tx in txs)
     assert any(tx.status == TransactionStatus.FAILED for tx in txs)
     assert any(tx.status == TransactionStatus.CANCELLED for tx in txs)
+
+
+def test_create_transfer_foreign_account_rejected() -> None:
+    bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
+    _fund(bank, 1, oleg_id, 1000)
+
+    with pytest.raises(InvalidOperationError, match="не принадлежит"):
+        processor.create_transfer(2, oleg_id, ivan_id, 100)
+
+
+def test_create_transfer_without_auth_rejected() -> None:
+    bank = Bank(now_provider=_safe_time)
+    queue = TransactionQueue()
+    processor = TransactionProcessor(bank, queue, now_provider=_safe_time)
+    client = _client(1, "Oleg")
+    bank.add_client(client)
+    account_id = bank.open_account(
+        client.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+
+    with pytest.raises(InvalidOperationError, match="не аутентифицирован"):
+        processor.create_transfer(1, account_id, account_id, 100)
+
+
+def test_create_transfer_locked_client_rejected() -> None:
+    bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
+    _fund(bank, 1, oleg_id, 1000)
+
+    for _ in range(3):
+        bank.authenticate_client(1, is_credentials_valid=False)
+
+    with pytest.raises(InvalidOperationError, match="заблокирован"):
+        processor.create_transfer(1, oleg_id, ivan_id, 100)

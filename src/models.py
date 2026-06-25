@@ -328,9 +328,6 @@ class TransactionProcessor:
         max_attempts: int = 3,
         scheduled_at: datetime | None = None,
     ) -> Transaction:
-        self.bank.authorize_operation(
-            client_id, sender_account_id, "transfer_from_foreign_account_attempt"
-        )
         sender = self.bank.accounts.get(sender_account_id)
         if sender is None:
             raise InvalidOperationError("Счет отправителя не найден.")
@@ -355,7 +352,7 @@ class TransactionProcessor:
         return transaction
 
     def _is_external_transfer(self, sender: BankAccount, receiver: BankAccount) -> bool:
-        return sender.currency != receiver.currency
+        return receiver.is_external
 
     def _calculate_fee(
         self, sender: BankAccount, receiver: BankAccount, amount: float
@@ -374,16 +371,17 @@ class TransactionProcessor:
         receiver: BankAccount,
         now: datetime,
     ) -> None:
+        if transaction.client_id is None:
+            raise InvalidOperationError("Клиент не указан.")
+
+        self.bank.authorize_operation(
+            transaction.client_id,
+            transaction.sender_account_id,
+            "transfer_from_foreign_account_attempt",
+        )
+
         sender.check_account_availability()
         receiver.check_account_availability()
-
-        if transaction.client_id is not None:
-            client = self.bank.clients.get(transaction.client_id)
-            if client is not None and client.status != ClientStatus.ACTIVE:
-                self.bank._mark_suspicious_action(
-                    client.id, "operation_for_locked_client"
-                )
-                raise InvalidOperationError("Клиент заблокирован.")
 
         if transaction.amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
@@ -401,10 +399,10 @@ class TransactionProcessor:
         )
         total_debit = transaction.amount + transaction.fee
         if isinstance(sender, PremiumAccount):
-            sender._withdraw(total_debit, apply_commission=False)
+            sender.withdraw(total_debit, apply_commission=False)
         else:
-            sender._withdraw(total_debit)
-        receiver._deposit(converted_amount)
+            sender.withdraw(total_debit)
+        receiver.deposit(converted_amount)
 
     def _handle_failure(
         self,
@@ -540,11 +538,11 @@ class AbstractAccount(ABC):
         pass
 
     @abstractmethod
-    def _deposit(self, amount: float) -> None:
+    def deposit(self, amount: float) -> None:
         pass
 
     @abstractmethod
-    def _withdraw(self, amount: float) -> None:
+    def withdraw(self, amount: float) -> None:
         pass
 
     @abstractmethod
@@ -559,10 +557,12 @@ class BankAccount(AbstractAccount):
         unique_index: str | None = None,
         currency: Currency = Currency.RUB,
         account_status: AccountType = AccountType.ACTIVE,
+        is_external: bool = False,
     ) -> None:
         self.unique_index = unique_index if unique_index else uuid.uuid4().hex[:8]
         self.user_data = self._validate_user_data(user_data)
         self._balance = 0.0
+        self.is_external = is_external
         if isinstance(account_status, AccountType):
             self.account_status = account_status
         else:
@@ -605,7 +605,7 @@ class BankAccount(AbstractAccount):
     def balance(self) -> float:
         return self._balance
 
-    def _deposit(self, amount: float) -> None:
+    def deposit(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -613,7 +613,7 @@ class BankAccount(AbstractAccount):
 
         self._balance += amount
 
-    def _withdraw(self, amount: float) -> None:
+    def withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -624,7 +624,7 @@ class BankAccount(AbstractAccount):
 
         self._balance -= amount
 
-    def _transfer(self, counterparty: BankAccount, amount: float) -> None:
+    def transfer(self, counterparty: BankAccount, amount: float) -> None:
         self.check_account_availability()
         counterparty.check_account_availability()
 
@@ -633,8 +633,8 @@ class BankAccount(AbstractAccount):
 
         converted_amount = self.currency_conversion(counterparty.currency, amount)
 
-        self._withdraw(amount)
-        counterparty._deposit(converted_amount)
+        self.withdraw(amount)
+        counterparty.deposit(converted_amount)
 
     def get_account_info(self) -> dict[str, Any]:
         return {
@@ -643,6 +643,7 @@ class BankAccount(AbstractAccount):
             "balance": self._balance,
             "account_status": self.account_status.value,
             "currency": self.currency.value,
+            "is_external": self.is_external,
         }
 
     def check_account_availability(self) -> bool:
@@ -704,7 +705,7 @@ class SavingsAccount(BankAccount):
         self.interest_rate = interest_rate
         self.min_balance = min_balance
 
-    def _withdraw(self, amount: float) -> None:
+    def withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -715,7 +716,7 @@ class SavingsAccount(BankAccount):
                 "Недостаточно средств для поддержания минимального баланса."
             )
 
-        super()._withdraw(amount)
+        super().withdraw(amount)
 
     def apply_monthly_interest(self) -> None:
         self.check_account_availability()
@@ -764,7 +765,7 @@ class PremiumAccount(BankAccount):
     def available_overdraft(self) -> float:
         return self.overdraft_limit - self.overdraft_used
 
-    def _withdraw(self, amount: float, *, apply_commission: bool = True) -> None:
+    def withdraw(self, amount: float, *, apply_commission: bool = True) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -778,7 +779,7 @@ class PremiumAccount(BankAccount):
 
         self._balance = new_balance
 
-    def _deposit(self, amount: float) -> None:
+    def deposit(self, amount: float) -> None:
         self.check_account_availability()
 
         if amount <= 0:
@@ -865,7 +866,7 @@ class InvestmentAccount(BankAccount):
             projected_portfolio[investment_type] = projected_amount
         return projected_portfolio
 
-    def _withdraw(self, amount: float) -> None:
+    def withdraw(self, amount: float) -> None:
         self.check_account_availability()
         if amount <= 0:
             raise InvalidOperationError("Сумма должна быть больше нуля.")
@@ -1186,14 +1187,14 @@ class Bank:
             client_id, account_id, "deposit_to_foreign_account_attempt"
         )
         account = self._get_account(account_id)
-        account._deposit(amount)
+        account.deposit(amount)
 
     def withdraw(self, client_id: int, account_id: str, amount: float) -> None:
         self.authorize_operation(
             client_id, account_id, "withdraw_from_foreign_account_attempt"
         )
         account = self._get_account(account_id)
-        account._withdraw(amount)
+        account.withdraw(amount)
 
     def transfer(
         self,
@@ -1207,7 +1208,7 @@ class Bank:
         )
         sender = self._get_account(sender_account_id)
         receiver = self._get_account(receiver_account_id)
-        sender._transfer(receiver, amount)
+        sender.transfer(receiver, amount)
 
     def seconds_until_open_hours(self, now: datetime | None = None) -> int:
         current = now or self._now_provider()

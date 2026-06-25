@@ -2,8 +2,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-import pytest
-
 from src.models import (
     AuditEvent,
     AuditLevel,
@@ -17,7 +15,6 @@ from src.models import (
     TransactionQueue,
     TransactionStatus,
 )
-from src.utils import InvalidOperationError
 
 
 def _safe_time() -> datetime:
@@ -360,9 +357,11 @@ def test_locked_client_transfer_blocked_in_processor() -> None:
         bank.authenticate_client(1, is_credentials_valid=False)
     assert bank.clients[1].status == "locked"
 
-    with pytest.raises(InvalidOperationError, match="заблокирован"):
-        processor.create_transfer(1, oleg_id, ivan_id, 100)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 100)
+    processor.process_next(now=_safe_time())
 
+    assert transaction.status == TransactionStatus.FAILED
+    assert "заблокирован" in (transaction.failure_reason or "").lower()
     assert any(
         action["reason"] == "operation_for_locked_client" and action["client_id"] == 1
         for action in bank.suspicious_actions

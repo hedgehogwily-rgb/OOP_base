@@ -1,7 +1,5 @@
 from datetime import datetime, timedelta
 
-import pytest
-
 from src.models import (
     AccountType,
     Bank,
@@ -13,7 +11,6 @@ from src.models import (
     TransactionQueue,
     TransactionStatus,
 )
-from src.utils import InvalidOperationError
 
 
 def _safe_time() -> datetime:
@@ -198,12 +195,26 @@ def test_premium_transfer_fee_in_transaction() -> None:
 def test_external_transfer_fee_applied() -> None:
     bank, _, processor, oleg_id, john_id, _ = _setup_bank_and_processor()
     _fund(bank, 1, oleg_id, 1000)
+    bank.accounts[john_id].is_external = True
+
     transaction = processor.create_transfer(1, oleg_id, john_id, 100, max_attempts=1)
 
     processor.process_next(now=_safe_time())
     assert transaction.status == TransactionStatus.COMPLETED
     assert transaction.fee == 3
     assert bank.accounts[oleg_id].balance == 897
+
+
+def test_cross_currency_internal_transfer_no_external_fee() -> None:
+    bank, _, processor, oleg_id, john_id, _ = _setup_bank_and_processor()
+    _fund(bank, 1, oleg_id, 1000)
+
+    transaction = processor.create_transfer(1, oleg_id, john_id, 100, max_attempts=1)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.COMPLETED
+    assert transaction.fee == 0
+    assert bank.accounts[oleg_id].balance == 900
 
 
 def test_retry_until_max_attempts_then_fail() -> None:
@@ -263,8 +274,11 @@ def test_create_transfer_foreign_account_rejected() -> None:
     bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
     _fund(bank, 1, oleg_id, 1000)
 
-    with pytest.raises(InvalidOperationError, match="не принадлежит"):
-        processor.create_transfer(2, oleg_id, ivan_id, 100)
+    transaction = processor.create_transfer(2, oleg_id, ivan_id, 100)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.FAILED
+    assert "не принадлежит" in (transaction.failure_reason or "")
 
 
 def test_create_transfer_without_auth_rejected() -> None:
@@ -278,8 +292,11 @@ def test_create_transfer_without_auth_rejected() -> None:
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
     )
 
-    with pytest.raises(InvalidOperationError, match="не аутентифицирован"):
-        processor.create_transfer(1, account_id, account_id, 100)
+    transaction = processor.create_transfer(1, account_id, account_id, 100)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.FAILED
+    assert "не аутентифицирован" in (transaction.failure_reason or "")
 
 
 def test_create_transfer_locked_client_rejected() -> None:
@@ -289,5 +306,8 @@ def test_create_transfer_locked_client_rejected() -> None:
     for _ in range(3):
         bank.authenticate_client(1, is_credentials_valid=False)
 
-    with pytest.raises(InvalidOperationError, match="заблокирован"):
-        processor.create_transfer(1, oleg_id, ivan_id, 100)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 100)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.FAILED
+    assert "заблокирован" in (transaction.failure_reason or "")

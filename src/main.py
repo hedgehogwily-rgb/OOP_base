@@ -364,19 +364,16 @@ def run_day6_demo(audit_log_path: str | None = None) -> dict[str, Any]:
     # LOCKED-клиент
     for _ in range(3):
         bank.authenticate_client(7, is_credentials_valid=False)
-    try:
-        _add_tx(
-            processor,
-            bank,
-            all_transactions,
-            acc["alex_rub"],
-            acc["oleg_rub"],
-            100,
-            max_attempts=1,
-            priority=7,
-        )
-    except InvalidOperationError as error:
-        logger.warning("Перевод от заблокированного клиента отклонён: %s", error)
+    _add_tx(
+        processor,
+        bank,
+        all_transactions,
+        acc["alex_rub"],
+        acc["oleg_rub"],
+        100,
+        max_attempts=1,
+        priority=7,
+    )
 
     # Подозрительные: новые получатели (автоматически через первые переводы)
     _add_tx(

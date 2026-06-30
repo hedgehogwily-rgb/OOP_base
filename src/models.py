@@ -378,6 +378,7 @@ class TransactionProcessor:
             transaction.client_id,
             transaction.sender_account_id,
             "transfer_from_foreign_account_attempt",
+            now=now,
         )
 
         sender.check_account_availability()
@@ -1006,8 +1007,10 @@ class Bank:
         current_hour = (now or self._now_provider()).hour
         return 0 <= current_hour < 5
 
-    def _ensure_allowed_operation_time(self, client_id: int) -> None:
-        if self.is_quiet_hours():
+    def _ensure_allowed_operation_time(
+        self, client_id: int, now: datetime | None = None
+    ) -> None:
+        if self.is_quiet_hours(now):
             self._mark_suspicious_action(client_id, "operation_during_quiet_hours")
             raise QuietHoursError()
 
@@ -1046,9 +1049,13 @@ class Bank:
             raise InvalidOperationError("Счет не принадлежит клиенту.")
 
     def authorize_operation(
-        self, client_id: int, account_id: str, reason: str
+        self,
+        client_id: int,
+        account_id: str,
+        reason: str,
+        now: datetime | None = None,
     ) -> Client:
-        self._ensure_allowed_operation_time(client_id)
+        self._ensure_allowed_operation_time(client_id, now=now)
         client = self._get_client(client_id)
         self._ensure_client_active(client)
         if client_id not in self.authenticated_clients:
@@ -1153,8 +1160,9 @@ class Bank:
     def get_total_balance(self, currency: Currency = BASE_CURRENCY) -> float:
         total = 0.0
         for account in self.accounts.values():
-            if account.account_status == AccountType.ACTIVE:
-                total += account.currency_conversion(currency, account.balance)
+            if account.account_status == AccountType.CLOSED:
+                continue
+            total += account.currency_conversion(currency, account.balance)
         return total
 
     def get_clients_ranking(
@@ -1168,7 +1176,7 @@ class Bank:
                 )
                 for acc_id in client.account_ids
                 if acc_id in self.accounts
-                and self.accounts[acc_id].account_status == AccountType.ACTIVE
+                and self.accounts[acc_id].account_status != AccountType.CLOSED
             )
             ranking.append(
                 {

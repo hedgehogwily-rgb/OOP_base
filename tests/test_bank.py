@@ -151,3 +151,36 @@ def test_total_balance_and_clients_ranking() -> None:
     assert ranking[0]["client_id"] == oleg.id
     assert ranking[0]["total_balance"] == 1000
     assert ranking[1]["client_id"] == john.id
+
+
+def test_frozen_account_included_in_balance_reports() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+    account_id = bank.open_account(
+        client.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.authenticate_client(client.id, is_credentials_valid=True)
+    bank.deposit(client.id, account_id, 1000)
+    bank.freeze_account(client.id, account_id)
+
+    assert bank.get_total_balance() == 1000
+    ranking = bank.get_clients_ranking()
+    assert ranking[0]["total_balance"] == 1000
+
+
+def test_closed_account_excluded_from_balance_reports() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+    account_id = bank.open_account(
+        client.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.authenticate_client(client.id, is_credentials_valid=True)
+    bank.deposit(client.id, account_id, 1000)
+    bank.close_account(client.id, account_id)
+
+    assert bank.get_total_balance() == 0
+    assert bank.get_clients_ranking()[0]["total_balance"] == 0

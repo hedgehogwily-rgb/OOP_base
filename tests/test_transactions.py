@@ -147,10 +147,23 @@ def test_quiet_hours_transaction_blocked() -> None:
     assert result is transaction
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
+    assert "Операции запрещены" in (transaction.failure_reason or "")
 
-    blocked = processor.audit_log.filter(event_type="transaction_blocked")
-    assert len(blocked) == 1
-    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+    failed = processor.audit_log.filter(event_type="transaction_failed")
+    assert len(failed) == 1
+
+
+def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
+    bank, _, processor, oleg_id, _, ivan_id = _setup_bank_and_processor()
+    _fund(bank, 1, oleg_id, 1000)
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 100)
+
+    result = processor.process_next(now=_quiet_time())
+
+    assert result is transaction
+    assert transaction.status == TransactionStatus.FAILED
+    assert bank.is_quiet_hours(_safe_time()) is False
+    assert "Операции запрещены" in (transaction.failure_reason or "")
 
 
 def test_frozen_account_rejected() -> None:

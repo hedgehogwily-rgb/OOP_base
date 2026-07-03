@@ -51,6 +51,9 @@ def _setup_bank_and_processor() -> tuple[Bank, TransactionProcessor, str, str]:
     bank.add_client(oleg)
     bank.add_client(ivan)
 
+    bank.authenticate_client(oleg.id, is_credentials_valid=True)
+    bank.authenticate_client(ivan.id, is_credentials_valid=True)
+
     oleg_id = bank.open_account(
         oleg.id,
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
@@ -59,8 +62,6 @@ def _setup_bank_and_processor() -> tuple[Bank, TransactionProcessor, str, str]:
         ivan.id,
         PremiumAccount({"name": "Ivan", "surname": "Test"}, currency=Currency.RUB),
     )
-    bank.authenticate_client(oleg.id, is_credentials_valid=True)
-    bank.authenticate_client(ivan.id, is_credentials_valid=True)
     return bank, processor, oleg_id, ivan_id
 
 
@@ -299,10 +300,16 @@ def test_night_dangerous_transaction_blocked() -> None:
 
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
-    assert "Операции запрещены" in (transaction.failure_reason or "")
 
-    failed = processor.audit_log.filter(event_type="transaction_failed")
-    assert len(failed) == 1
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Большая сумма транзакции" in blocked[0].metadata["reasons"]
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "Большая сумма транзакции" in risk_events[0].metadata["reasons"]
+    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
 
 
 def test_night_normal_transaction_blocked_with_risk_detected() -> None:
@@ -315,10 +322,14 @@ def test_night_normal_transaction_blocked_with_risk_detected() -> None:
     assert result is transaction
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
-    assert "Операции запрещены" in (transaction.failure_reason or "")
 
-    failed = processor.audit_log.filter(event_type="transaction_failed")
-    assert len(failed) == 1
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
 
 
 def test_blocked_transaction_does_not_consume_new_receiver() -> None:

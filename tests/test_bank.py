@@ -24,10 +24,15 @@ def _create_client(client_id: int, name: str) -> Client:
     )
 
 
+def _authenticate(bank: Bank, client_id: int) -> None:
+    bank.authenticate_client(client_id, is_credentials_valid=True)
+
+
 def test_add_client_and_open_account() -> None:
     bank = Bank(now_provider=_safe_time)
     client = _create_client(1, "Oleg")
     bank.add_client(client)
+    _authenticate(bank, client.id)
 
     account = BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB)
     account_id = bank.open_account(client.id, account)
@@ -36,10 +41,21 @@ def test_add_client_and_open_account() -> None:
     assert account_id in client.account_ids
 
 
+def test_open_account_requires_authentication() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+    account = BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB)
+
+    with pytest.raises(InvalidOperationError, match="не аутентифицирован"):
+        bank.open_account(client.id, account)
+
+
 def test_close_freeze_and_unfreeze_account() -> None:
     bank = Bank(now_provider=_safe_time)
     client = _create_client(1, "Oleg")
     bank.add_client(client)
+    _authenticate(bank, client.id)
     account = BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB)
     account_id = bank.open_account(client.id, account)
 
@@ -55,6 +71,41 @@ def test_close_freeze_and_unfreeze_account() -> None:
     assert bank.search_accounts(client_id=client.id, status=AccountType.CLOSED) == [
         account
     ]
+
+
+def test_cannot_freeze_or_reopen_closed_account() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+    _authenticate(bank, client.id)
+    account_id = bank.open_account(
+        client.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.close_account(client.id, account_id)
+
+    with pytest.raises(InvalidOperationError, match="нельзя заморозить"):
+        bank.freeze_account(client.id, account_id)
+
+    with pytest.raises(InvalidOperationError, match="Закрытый счет нельзя разморозить"):
+        bank.unfreeze_account(client.id, account_id)
+
+
+def test_cannot_close_account_with_balance() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+    _authenticate(bank, client.id)
+    account_id = bank.open_account(
+        client.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.deposit(client.id, account_id, 1000)
+
+    with pytest.raises(InvalidOperationError, match="ненулевым балансом"):
+        bank.close_account(client.id, account_id)
+
+    assert bank.get_total_balance() == 1000
 
 
 def test_authenticate_locks_after_three_attempts() -> None:
@@ -78,6 +129,9 @@ def test_locked_client_cannot_operate() -> None:
     bank.add_client(sender)
     bank.add_client(receiver)
 
+    _authenticate(bank, sender.id)
+    _authenticate(bank, receiver.id)
+
     sender_account_id = bank.open_account(
         sender.id,
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
@@ -86,7 +140,6 @@ def test_locked_client_cannot_operate() -> None:
         receiver.id,
         BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB),
     )
-    bank.authenticate_client(sender.id, is_credentials_valid=True)
     bank.deposit(sender.id, sender_account_id, 1000)
 
     for _ in range(3):
@@ -117,6 +170,7 @@ def test_open_account_forbidden_during_quiet_hours() -> None:
     bank = Bank(now_provider=_quiet_time)
     client = _create_client(1, "Oleg")
     bank.add_client(client)
+    _authenticate(bank, client.id)
     account = BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB)
 
     with pytest.raises(InvalidOperationError, match="Операции запрещены"):
@@ -138,11 +192,11 @@ def test_total_balance_and_clients_ranking() -> None:
     john_account = BankAccount(
         {"name": "John", "surname": "Test"}, currency=Currency.RUB
     )
+    _authenticate(bank, oleg.id)
+    _authenticate(bank, john.id)
     oleg_id = bank.open_account(oleg.id, oleg_account)
     john_id = bank.open_account(john.id, john_account)
 
-    bank.authenticate_client(oleg.id, is_credentials_valid=True)
-    bank.authenticate_client(john.id, is_credentials_valid=True)
     bank.deposit(oleg.id, oleg_id, 1000)
     bank.deposit(john.id, john_id, 500)
 
@@ -157,11 +211,11 @@ def test_frozen_account_included_in_balance_reports() -> None:
     bank = Bank(now_provider=_safe_time)
     client = _create_client(1, "Oleg")
     bank.add_client(client)
+    _authenticate(bank, client.id)
     account_id = bank.open_account(
         client.id,
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
     )
-    bank.authenticate_client(client.id, is_credentials_valid=True)
     bank.deposit(client.id, account_id, 1000)
     bank.freeze_account(client.id, account_id)
 
@@ -170,16 +224,17 @@ def test_frozen_account_included_in_balance_reports() -> None:
     assert ranking[0]["total_balance"] == 1000
 
 
-def test_closed_account_excluded_from_balance_reports() -> None:
+def test_closed_account_excluded_after_zero_balance_close() -> None:
     bank = Bank(now_provider=_safe_time)
     client = _create_client(1, "Oleg")
     bank.add_client(client)
+    _authenticate(bank, client.id)
     account_id = bank.open_account(
         client.id,
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
     )
-    bank.authenticate_client(client.id, is_credentials_valid=True)
     bank.deposit(client.id, account_id, 1000)
+    bank.withdraw(client.id, account_id, 1000)
     bank.close_account(client.id, account_id)
 
     assert bank.get_total_balance() == 0

@@ -379,6 +379,7 @@ class TransactionProcessor:
             transaction.sender_account_id,
             "transfer_from_foreign_account_attempt",
             now=now,
+            check_quiet_hours=False,
         )
 
         sender.check_account_availability()
@@ -677,9 +678,13 @@ class BankAccount(AbstractAccount):
         return amount_in_rub * exchange_rates[target_currency]
 
     def freeze_account(self) -> None:
+        if self.account_status == AccountType.CLOSED:
+            raise InvalidOperationError("Закрытый счет нельзя заморозить.")
         self.account_status = AccountType.FROZEN
 
     def close_account(self) -> None:
+        if self.account_status == AccountType.CLOSED:
+            raise InvalidOperationError("Счет уже закрыт.")
         self.account_status = AccountType.CLOSED
 
     def __str__(self) -> str:
@@ -1048,18 +1053,25 @@ class Bank:
             self._mark_suspicious_action(client.id, reason)
             raise InvalidOperationError("Счет не принадлежит клиенту.")
 
+    def _ensure_authenticated(self, client_id: int) -> Client:
+        client = self._get_client(client_id)
+        self._ensure_client_active(client)
+        if client_id not in self.authenticated_clients:
+            raise InvalidOperationError("Клиент не аутентифицирован.")
+        return client
+
     def authorize_operation(
         self,
         client_id: int,
         account_id: str,
         reason: str,
         now: datetime | None = None,
+        *,
+        check_quiet_hours: bool = True,
     ) -> Client:
-        self._ensure_allowed_operation_time(client_id, now=now)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
-        if client_id not in self.authenticated_clients:
-            raise InvalidOperationError("Клиент не аутентифицирован.")
+        if check_quiet_hours:
+            self._ensure_allowed_operation_time(client_id, now=now)
+        client = self._ensure_authenticated(client_id)
         self._ensure_owned(client, account_id, reason)
         return client
 
@@ -1085,12 +1097,7 @@ class Bank:
 
     def open_account(self, client_id: int, account: BankAccount) -> str:
         self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-
-        if client.status != ClientStatus.ACTIVE:
-            raise InvalidOperationError(
-                "Открытие счета доступно только активному клиенту."
-            )
+        client = self._ensure_authenticated(client_id)
 
         account_id = account.unique_index
         if account_id in self.accounts:
@@ -1102,30 +1109,37 @@ class Bank:
 
     def close_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
+        client = self._ensure_authenticated(client_id)
         account = self._get_account(account_id)
 
         if account_id not in client.account_ids:
             self._mark_suspicious_action(client_id, "close_foreign_account_attempt")
             raise InvalidOperationError("Счет не принадлежит клиенту.")
 
+        if account.balance > 0:
+            raise InvalidOperationError("Нельзя закрыть счет с ненулевым балансом.")
+
+        if isinstance(account, InvestmentAccount) and any(
+            amount > 0 for amount in account.investment_portfolio.values()
+        ):
+            raise InvalidOperationError("Нельзя закрыть счет с инвестициями.")
+
         account.close_account()
 
     def freeze_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
+        client = self._ensure_authenticated(client_id)
         account = self._get_account(account_id)
         if account_id not in client.account_ids:
             self._mark_suspicious_action(client_id, "freeze_foreign_account_attempt")
             raise InvalidOperationError("Счет не принадлежит клиенту.")
+        if account.account_status == AccountType.CLOSED:
+            raise InvalidOperationError("Закрытый счет нельзя заморозить.")
         account.freeze_account()
 
     def unfreeze_account(self, client_id: int, account_id: str) -> None:
         self._ensure_allowed_operation_time(client_id)
-        client = self._get_client(client_id)
-        self._ensure_client_active(client)
+        client = self._ensure_authenticated(client_id)
         account = self._get_account(account_id)
         if account_id not in client.account_ids:
             self._mark_suspicious_action(client_id, "unfreeze_foreign_account_attempt")

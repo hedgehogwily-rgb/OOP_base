@@ -62,6 +62,8 @@ def _setup_bank_and_processor() -> tuple[
     bank.add_client(john)
     bank.add_client(ivan)
 
+    _authenticate_clients(bank, [oleg.id, john.id, ivan.id])
+
     oleg_account_id = bank.open_account(
         oleg.id,
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
@@ -74,7 +76,6 @@ def _setup_bank_and_processor() -> tuple[
         ivan.id,
         PremiumAccount({"name": "Ivan", "surname": "Test"}, currency=Currency.RUB),
     )
-    _authenticate_clients(bank, [oleg.id, john.id, ivan.id])
     return bank, queue, processor, oleg_account_id, john_account_id, ivan_account_id
 
 
@@ -147,10 +148,10 @@ def test_quiet_hours_transaction_blocked() -> None:
     assert result is transaction
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
-    assert "Операции запрещены" in (transaction.failure_reason or "")
 
-    failed = processor.audit_log.filter(event_type="transaction_failed")
-    assert len(failed) == 1
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
 
 
 def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
@@ -163,7 +164,9 @@ def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
     assert result is transaction
     assert transaction.status == TransactionStatus.FAILED
     assert bank.is_quiet_hours(_safe_time()) is False
-    assert "Операции запрещены" in (transaction.failure_reason or "")
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
 
 
 def test_frozen_account_rejected() -> None:
@@ -300,10 +303,12 @@ def test_create_transfer_without_auth_rejected() -> None:
     processor = TransactionProcessor(bank, queue, now_provider=_safe_time)
     client = _client(1, "Oleg")
     bank.add_client(client)
+    bank.authenticate_client(client.id, is_credentials_valid=True)
     account_id = bank.open_account(
         client.id,
         BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
     )
+    bank.authenticated_clients.discard(client.id)
 
     transaction = processor.create_transfer(1, account_id, account_id, 100)
     processor.process_next(now=_safe_time())

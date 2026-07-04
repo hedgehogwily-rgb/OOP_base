@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 
-from src.models import AccountType, Bank, BankAccount, Client, Currency
+from src.models import AccountType, Bank, BankAccount, Client, Currency, PremiumAccount
 from src.utils import InvalidOperationError
 
 
@@ -106,6 +106,27 @@ def test_cannot_close_account_with_balance() -> None:
         bank.close_account(client.id, account_id)
 
     assert bank.get_total_balance() == 1000
+
+
+def test_cannot_close_premium_account_with_debt() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+    _authenticate(bank, client.id)
+    account_id = bank.open_account(
+        client.id,
+        PremiumAccount(
+            {"name": "Oleg", "surname": "Test"},
+            currency=Currency.RUB,
+            overdraft_limit=500,
+        ),
+    )
+    bank.withdraw(client.id, account_id, 100)
+
+    with pytest.raises(InvalidOperationError, match="ненулевым балансом"):
+        bank.close_account(client.id, account_id)
+
+    assert bank.accounts[account_id].balance < 0
 
 
 def test_authenticate_locks_after_three_attempts() -> None:

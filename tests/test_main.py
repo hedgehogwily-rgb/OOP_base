@@ -102,6 +102,16 @@ def test_premium_overdraft_limit(user: dict[str, Any]) -> None:
         acc.withdraw(1000)
 
 
+def test_premium_rejects_negative_commission(user: dict[str, Any]) -> None:
+    with pytest.raises(InvalidOperationError, match="Комиссия"):
+        PremiumAccount(user, commission=-100)
+
+
+def test_premium_rejects_negative_overdraft_limit(user: dict[str, Any]) -> None:
+    with pytest.raises(InvalidOperationError, match="овердрафта"):
+        PremiumAccount(user, overdraft_limit=-1)
+
+
 # Тесты для InvestmentAccount
 
 

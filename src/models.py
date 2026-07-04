@@ -760,8 +760,8 @@ class PremiumAccount(BankAccount):
         commission: float = 10.0,
     ) -> None:
         super().__init__(user_data, unique_index, currency, account_status)
-        self.overdraft_limit = overdraft_limit
-        self.commission = commission
+        self.overdraft_limit = self._validate_overdraft_limit(overdraft_limit)
+        self.commission = self._validate_commission(commission)
 
     @property
     def overdraft_used(self) -> float:
@@ -792,6 +792,20 @@ class PremiumAccount(BankAccount):
             raise InvalidOperationError("Сумма должна быть больше нуля.")
 
         self._balance += amount
+
+    @staticmethod
+    def _validate_overdraft_limit(overdraft_limit: float) -> float:
+        if overdraft_limit < 0:
+            raise InvalidOperationError("Лимит овердрафта должен быть неотрицательным.")
+        return overdraft_limit
+
+    @staticmethod
+    def _validate_commission(commission: float) -> float:
+        if commission < 0:
+            raise InvalidOperationError("Комиссия должна быть неотрицательной.")
+        if commission > 100:
+            raise InvalidOperationError("Комиссия не может превышать 100.")
+        return commission
 
     def get_account_info(self) -> dict[str, Any]:
         base_info = super().get_account_info()
@@ -1116,13 +1130,18 @@ class Bank:
             self._mark_suspicious_action(client_id, "close_foreign_account_attempt")
             raise InvalidOperationError("Счет не принадлежит клиенту.")
 
-        if account.balance > 0:
+        if account.balance != 0:
             raise InvalidOperationError("Нельзя закрыть счет с ненулевым балансом.")
 
         if isinstance(account, InvestmentAccount) and any(
             amount > 0 for amount in account.investment_portfolio.values()
         ):
             raise InvalidOperationError("Нельзя закрыть счет с инвестициями.")
+
+        if isinstance(account, PremiumAccount) and account.balance < 0:
+            raise InvalidOperationError(
+                "Нельзя закрыть счет с использованным overdraft."
+            )
 
         account.close_account()
 

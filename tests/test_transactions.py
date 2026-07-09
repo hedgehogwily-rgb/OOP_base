@@ -45,7 +45,7 @@ def _fund(bank: Bank, client_id: int, account_id: str, amount: float) -> None:
 def _setup_bank_and_processor() -> tuple[
     Bank, TransactionQueue, TransactionProcessor, str, str, str
 ]:
-    bank = Bank(now_provider=_safe_time)
+    bank = Bank(now_provider=_safe_time, external_transfer_fee_rate=0.03)
     queue = TransactionQueue()
     processor = TransactionProcessor(
         bank,
@@ -149,9 +149,12 @@ def test_quiet_hours_transaction_blocked() -> None:
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
 
-    blocked = processor.audit_log.filter(event_type="transaction_blocked")
-    assert len(blocked) == 1
-    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+    failed = processor.audit_log.filter(event_type="transaction_failed")
+    assert len(failed) == 1
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]
 
 
 def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
@@ -164,9 +167,13 @@ def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
     assert result is transaction
     assert transaction.status == TransactionStatus.FAILED
     assert bank.is_quiet_hours(_safe_time()) is False
-    blocked = processor.audit_log.filter(event_type="transaction_blocked")
-    assert len(blocked) == 1
-    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+
+    failed = processor.audit_log.filter(event_type="transaction_failed")
+    assert len(failed) == 1
+
+    risk_events = processor.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]
 
 
 def test_frozen_account_rejected() -> None:

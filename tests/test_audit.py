@@ -36,7 +36,7 @@ def _client(client_id: int, name: str) -> Client:
 
 
 def _setup_bank_and_processor() -> tuple[Bank, TransactionProcessor, str, str]:
-    bank = Bank(now_provider=_safe_time)
+    bank = Bank(now_provider=_safe_time, external_transfer_fee_rate=0.03)
     queue = TransactionQueue()
     processor = TransactionProcessor(
         bank,
@@ -301,15 +301,15 @@ def test_night_dangerous_transaction_blocked() -> None:
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
 
-    blocked = processor.audit_log.filter(event_type="transaction_blocked")
-    assert len(blocked) == 1
-    assert "Большая сумма транзакции" in blocked[0].metadata["reasons"]
-    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+    failed = processor.audit_log.filter(event_type="transaction_failed")
+    assert len(failed) == 1
 
     risk_events = processor.audit_log.filter(event_type="risk_detected")
     assert len(risk_events) == 1
-    assert "Большая сумма транзакции" in risk_events[0].metadata["reasons"]
-    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 0
 
 
 def test_night_normal_transaction_blocked_with_risk_detected() -> None:
@@ -323,13 +323,15 @@ def test_night_normal_transaction_blocked_with_risk_detected() -> None:
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
 
+    failed = processor.audit_log.filter(event_type="transaction_failed")
+    assert len(failed) == 1
+
     risk_events = processor.audit_log.filter(event_type="risk_detected")
     assert len(risk_events) == 1
-    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]
 
     blocked = processor.audit_log.filter(event_type="transaction_blocked")
-    assert len(blocked) == 1
-    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+    assert len(blocked) == 0
 
 
 def test_blocked_transaction_does_not_consume_new_receiver() -> None:
@@ -385,3 +387,23 @@ def test_frequent_operations_count_failed_attempts() -> None:
         if "Частота транзакций превышает 5 за 10 минут" in event.metadata["reasons"]
     ]
     assert len(frequency_events) >= 1
+
+
+def test_quiet_hours_via_bank_authorize() -> None:
+    bank, processor, oleg_id, ivan_id = _setup_bank_and_processor()
+    _fund(bank, 1, oleg_id, 1000)
+
+    assert processor.audit_log is bank.audit_log
+
+    transaction = processor.create_transfer(1, oleg_id, ivan_id, 100)
+    processor.process_next(now=_quiet_time())
+
+    assert transaction.status == TransactionStatus.FAILED
+    assert bank.accounts[ivan_id].balance == 0
+
+    failed = bank.audit_log.filter(event_type="transaction_failed")
+    assert len(failed) == 1
+
+    risk_events = bank.audit_log.filter(event_type="risk_detected")
+    assert len(risk_events) == 1
+    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]

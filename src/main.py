@@ -161,16 +161,21 @@ def run_day6_demo(audit_log_path: str | None = None) -> dict[str, Any]:
     def fixed_now() -> datetime:
         return current_time
 
-    bank = Bank(now_provider=fixed_now)
-    queue = TransactionQueue()
     audit_log = AuditLog(file_path=audit_log_path)
+    bank = Bank(
+        now_provider=fixed_now,
+        audit_log=audit_log,
+        external_transfer_fee_rate=0.03,
+    )
+    queue = TransactionQueue()
     processor = TransactionProcessor(
         bank=bank,
         queue=queue,
         external_transfer_fee_rate=0.03,
         retry_delay_seconds=0,
         now_provider=fixed_now,
-        audit_log=audit_log,
+        audit_log=bank.audit_log,
+        risk_analyzer=bank.risk_analyzer,
     )
     all_transactions: list[Transaction] = []
 
@@ -521,16 +526,21 @@ def run_day4_demo(audit_log_path: str | None = None) -> None:
     def fixed_now() -> datetime:
         return datetime(2026, 1, 1, 10, 0, 0)
 
-    bank = Bank(now_provider=fixed_now)
-    queue = TransactionQueue()
     audit_log = AuditLog(file_path=audit_log_path)
+    bank = Bank(
+        now_provider=fixed_now,
+        audit_log=audit_log,
+        external_transfer_fee_rate=0.03,
+    )
+    queue = TransactionQueue()
     processor = TransactionProcessor(
         bank=bank,
         queue=queue,
         external_transfer_fee_rate=0.03,
         retry_delay_seconds=0,
         now_provider=fixed_now,
-        audit_log=audit_log,
+        audit_log=bank.audit_log,
+        risk_analyzer=bank.risk_analyzer,
     )
 
     oleg = Client("Oleg", "Ezhikov", 1, 28, contacts=["+7-900-000-00-01"])

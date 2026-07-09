@@ -285,8 +285,8 @@ class TransactionProcessor:
         self.retry_delay_seconds = retry_delay_seconds
         self.error_log: list[dict[str, Any]] = []
         self._now_provider = now_provider or datetime.now
-        self.risk_analyzer = risk_analyzer or RiskAnalyzer(bank)
-        self.audit_log = audit_log or AuditLog()
+        self.risk_analyzer = risk_analyzer or bank.risk_analyzer
+        self.audit_log = audit_log or bank.audit_log
 
     def _now(self) -> datetime:
         return self._now_provider()
@@ -357,12 +357,7 @@ class TransactionProcessor:
     def _calculate_fee(
         self, sender: BankAccount, receiver: BankAccount, amount: float
     ) -> float:
-        fee = 0.0
-        if self._is_external_transfer(sender, receiver):
-            fee += amount * self.external_transfer_fee_rate
-        if isinstance(sender, PremiumAccount):
-            fee += sender.commission
-        return fee
+        return self.bank._calculate_transfer_fee(sender, receiver, amount)
 
     def _validate_business_rules(
         self,
@@ -379,7 +374,6 @@ class TransactionProcessor:
             transaction.sender_account_id,
             "transfer_from_foreign_account_attempt",
             now=now,
-            check_quiet_hours=False,
         )
 
         sender.check_account_availability()
@@ -396,15 +390,7 @@ class TransactionProcessor:
     def _execute_transfer(
         self, transaction: Transaction, sender: BankAccount, receiver: BankAccount
     ) -> None:
-        converted_amount = sender.currency_conversion(
-            receiver.currency, transaction.amount
-        )
-        total_debit = transaction.amount + transaction.fee
-        if isinstance(sender, PremiumAccount):
-            sender.withdraw(total_debit, apply_commission=False)
-        else:
-            sender.withdraw(total_debit)
-        receiver.deposit(converted_amount)
+        self.bank._execute_transfer(transaction, sender, receiver)
 
     def _handle_failure(
         self,
@@ -457,45 +443,18 @@ class TransactionProcessor:
             if receiver is None:
                 raise InvalidOperationError("Счет получателя не найден.")
 
-            self.risk_analyzer.register_frequency(transaction, current_time)
             transaction.fee = self._calculate_fee(sender, receiver, transaction.amount)
             self._validate_business_rules(transaction, sender, receiver, current_time)
-
-            assessment = self.risk_analyzer.analyze_transaction(
-                transaction, sender, current_time
-            )
-
-            if assessment.level != RiskLevel.LOW:
-                self._record_audit(
-                    transaction=transaction,
-                    level=audit_level_from_risk(assessment.level),
-                    event_type="risk_detected",
-                    message="Риск-анализ транзакции",
-                    now=current_time,
-                    metadata={"reasons": assessment.reasons},
-                )
-
-            if assessment.level == RiskLevel.HIGH:
-                self._record_audit(
-                    transaction=transaction,
-                    level=AuditLevel.HIGH,
-                    event_type="transaction_blocked",
-                    message="Операция заблокирована риск-анализом",
-                    now=current_time,
-                    metadata={"reasons": assessment.reasons},
-                )
-                transaction.mark_failed(
-                    "Операция заблокирована риск-анализом: "
-                    + ", ".join(assessment.reasons),
-                    now=current_time,
-                )
-                return transaction
-
+            self.bank.evaluate_transfer_risk(transaction, sender, current_time)
             self._execute_transfer(transaction, sender, receiver)
             transaction.mark_completed(current_time)
             self.risk_analyzer.register_receiver(transaction)
         except InvalidOperationError as error:
-            self._handle_failure(transaction, error, current_time, retryable=False)
+            error_message = str(error)
+            if error_message.startswith("Операция заблокирована риск-анализом"):
+                transaction.mark_failed(error_message, now=current_time)
+            else:
+                self._handle_failure(transaction, error, current_time, retryable=False)
         except Exception as error:
             self._handle_failure(
                 transaction=transaction,
@@ -998,10 +957,20 @@ class Client:
 
 
 class Bank:
+    _SUSPICIOUS_REASON_AUDIT: dict[str, tuple[AuditLevel, str]] = {
+        "failed_auth": (AuditLevel.MEDIUM, "security_event"),
+        "client_locked_after_failed_auth": (AuditLevel.HIGH, "security_event"),
+        "operation_for_locked_client": (AuditLevel.HIGH, "security_event"),
+        "auth_attempt_for_locked_client": (AuditLevel.HIGH, "security_event"),
+        "operation_during_quiet_hours": (AuditLevel.HIGH, "risk_detected"),
+    }
+
     def __init__(
         self,
         clients: list[Client] | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        audit_log: AuditLog | None = None,
+        external_transfer_fee_rate: float = 0.02,
     ) -> None:
         self.clients: dict[int, Client] = {}
         self.accounts: dict[str, BankAccount] = {}
@@ -1009,17 +978,50 @@ class Bank:
         self.authenticated_clients: set[int] = set()
         self.suspicious_actions: list[dict[str, Any]] = []
         self._now_provider = now_provider or datetime.now
+        self.audit_log = audit_log or AuditLog()
+        self.external_transfer_fee_rate = external_transfer_fee_rate
+        self.risk_analyzer = RiskAnalyzer(self)
 
         for client in clients or []:
             self.add_client(client)
 
-    def _mark_suspicious_action(self, client_id: int, reason: str) -> None:
+    @classmethod
+    def _audit_for_suspicious_reason(cls, reason: str) -> tuple[AuditLevel, str]:
+        if reason in cls._SUSPICIOUS_REASON_AUDIT:
+            return cls._SUSPICIOUS_REASON_AUDIT[reason]
+        if reason.endswith("_foreign_account_attempt"):
+            return AuditLevel.HIGH, "security_event"
+        return AuditLevel.MEDIUM, "security_event"
+
+    def _mark_suspicious_action(
+        self,
+        client_id: int,
+        reason: str,
+        *,
+        account_id: str | None = None,
+        transaction_id: str | None = None,
+    ) -> None:
+        now = self._now_provider()
         self.suspicious_actions.append(
             {
                 "client_id": client_id,
                 "reason": reason,
-                "timestamp": self._now_provider().isoformat(timespec="seconds"),
+                "timestamp": now.isoformat(timespec="seconds"),
             }
+        )
+        level, event_type = self._audit_for_suspicious_reason(reason)
+        self.audit_log.record_event(
+            AuditEvent(
+                id=uuid.uuid4().hex[:12],
+                timestamp=now,
+                level=level,
+                event_type=event_type,
+                message=reason,
+                client_id=client_id,
+                account_id=account_id,
+                transaction_id=transaction_id,
+                metadata={"reasons": [reason]},
+            )
         )
 
     def is_quiet_hours(self, now: datetime | None = None) -> bool:
@@ -1027,10 +1029,17 @@ class Bank:
         return 0 <= current_hour < 5
 
     def _ensure_allowed_operation_time(
-        self, client_id: int, now: datetime | None = None
+        self,
+        client_id: int,
+        now: datetime | None = None,
+        account_id: str | None = None,
     ) -> None:
         if self.is_quiet_hours(now):
-            self._mark_suspicious_action(client_id, "operation_during_quiet_hours")
+            self._mark_suspicious_action(
+                client_id,
+                "operation_during_quiet_hours",
+                account_id=account_id,
+            )
             raise QuietHoursError()
 
     def _get_client(self, client_id: int) -> Client:
@@ -1084,7 +1093,9 @@ class Bank:
         check_quiet_hours: bool = True,
     ) -> Client:
         if check_quiet_hours:
-            self._ensure_allowed_operation_time(client_id, now=now)
+            self._ensure_allowed_operation_time(
+                client_id, now=now, account_id=account_id
+            )
         client = self._ensure_authenticated(client_id)
         self._ensure_owned(client, account_id, reason)
         return client
@@ -1237,19 +1248,130 @@ class Bank:
         account = self._get_account(account_id)
         account.withdraw(amount)
 
+    def _record_transaction_audit(
+        self,
+        transaction: Transaction,
+        level: AuditLevel,
+        event_type: str,
+        message: str,
+        now: datetime,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.audit_log.record_event(
+            AuditEvent(
+                id=uuid.uuid4().hex[:12],
+                timestamp=now,
+                level=level,
+                event_type=event_type,
+                message=message,
+                client_id=transaction.client_id,
+                account_id=transaction.sender_account_id,
+                transaction_id=transaction.id,
+                metadata=metadata,
+            )
+        )
+
+    def evaluate_transfer_risk(
+        self,
+        transaction: Transaction,
+        sender: BankAccount,
+        now: datetime | None = None,
+    ) -> RiskAssessment:
+        current_time = now or self._now_provider()
+        self.risk_analyzer.register_frequency(transaction, current_time)
+        assessment = self.risk_analyzer.analyze_transaction(
+            transaction, sender, current_time
+        )
+        if assessment.level != RiskLevel.LOW:
+            self._record_transaction_audit(
+                transaction=transaction,
+                level=audit_level_from_risk(assessment.level),
+                event_type="risk_detected",
+                message="Риск-анализ транзакции",
+                now=current_time,
+                metadata={"reasons": assessment.reasons},
+            )
+        if assessment.level == RiskLevel.HIGH:
+            self._record_transaction_audit(
+                transaction=transaction,
+                level=AuditLevel.HIGH,
+                event_type="transaction_blocked",
+                message="Операция заблокирована риск-анализом",
+                now=current_time,
+                metadata={"reasons": assessment.reasons},
+            )
+            raise InvalidOperationError(
+                "Операция заблокирована риск-анализом: "
+                + ", ".join(assessment.reasons)
+            )
+        return assessment
+
+    def _is_external_transfer(
+        self, sender: BankAccount, receiver: BankAccount
+    ) -> bool:
+        return receiver.is_external
+
+    def _calculate_transfer_fee(
+        self, sender: BankAccount, receiver: BankAccount, amount: float
+    ) -> float:
+        fee = 0.0
+        if self._is_external_transfer(sender, receiver):
+            fee += amount * self.external_transfer_fee_rate
+        if isinstance(sender, PremiumAccount):
+            fee += sender.commission
+        return fee
+
+    def _execute_transfer(
+        self, transaction: Transaction, sender: BankAccount, receiver: BankAccount
+    ) -> None:
+        converted_amount = sender.currency_conversion(
+            receiver.currency, transaction.amount
+        )
+        total_debit = transaction.amount + transaction.fee
+        if isinstance(sender, PremiumAccount):
+            sender.withdraw(total_debit, apply_commission=False)
+        else:
+            sender.withdraw(total_debit)
+        receiver.deposit(converted_amount)
+
     def transfer(
         self,
         client_id: int,
         sender_account_id: str,
         receiver_account_id: str,
         amount: float,
+        now: datetime | None = None,
     ) -> None:
+        current_time = now or self._now_provider()
         self.authorize_operation(
-            client_id, sender_account_id, "transfer_from_foreign_account_attempt"
+            client_id,
+            sender_account_id,
+            "transfer_from_foreign_account_attempt",
+            now=current_time,
         )
         sender = self._get_account(sender_account_id)
         receiver = self._get_account(receiver_account_id)
-        sender.transfer(receiver, amount)
+        if amount <= 0:
+            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        sender.check_account_availability()
+        receiver.check_account_availability()
+        if sender.balance < 0 and not isinstance(sender, PremiumAccount):
+            raise InvalidOperationError(
+                "Переводы при отрицательном балансе разрешены только для премиум-счетов."
+            )
+
+        transaction = Transaction(
+            type=TransactionType.TRANSFER,
+            amount=amount,
+            currency=sender.currency,
+            sender_account_id=sender_account_id,
+            receiver_account_id=receiver_account_id,
+            client_id=client_id,
+        )
+        transaction.fee = self._calculate_transfer_fee(sender, receiver, amount)
+        self.evaluate_transfer_risk(transaction, sender, current_time)
+        self._execute_transfer(transaction, sender, receiver)
+        self.risk_analyzer.register_receiver(transaction)
 
     def seconds_until_open_hours(self, now: datetime | None = None) -> int:
         current = now or self._now_provider()

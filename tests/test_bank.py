@@ -260,3 +260,73 @@ def test_closed_account_excluded_after_zero_balance_close() -> None:
 
     assert bank.get_total_balance() == 0
     assert bank.get_clients_ranking()[0]["total_balance"] == 0
+
+
+def test_bank_transfer_large_amount_blocked() -> None:
+    bank = Bank(now_provider=_safe_time)
+    sender = _create_client(1, "Oleg")
+    receiver = _create_client(2, "John")
+    bank.add_client(sender)
+    bank.add_client(receiver)
+    _authenticate(bank, sender.id)
+    _authenticate(bank, receiver.id)
+    sender_account_id = bank.open_account(
+        sender.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    receiver_account_id = bank.open_account(
+        receiver.id,
+        BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.deposit(sender.id, sender_account_id, 200_000_000)
+
+    with pytest.raises(InvalidOperationError, match="риск-анализом"):
+        bank.transfer(sender.id, sender_account_id, receiver_account_id, 150_000_000)
+
+    assert bank.accounts[receiver_account_id].balance == 0
+    blocked = bank.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Большая сумма транзакции" in blocked[0].metadata["reasons"]
+
+
+def test_failed_auth_recorded_in_audit_log() -> None:
+    bank = Bank(now_provider=_safe_time)
+    client = _create_client(1, "Oleg")
+    bank.add_client(client)
+
+    for _ in range(3):
+        bank.authenticate_client(client.id, is_credentials_valid=False)
+
+    profile = bank.audit_log.get_client_risk_profile(client.id)
+    assert profile["total_events"] == 4
+    assert profile["reasons"]["failed_auth"] == 3
+    assert profile["reasons"]["client_locked_after_failed_auth"] == 1
+
+
+def test_foreign_account_attempt_in_audit() -> None:
+    bank = Bank(now_provider=_safe_time)
+    sender = _create_client(1, "Oleg")
+    receiver = _create_client(2, "John")
+    bank.add_client(sender)
+    bank.add_client(receiver)
+    _authenticate(bank, sender.id)
+    _authenticate(bank, receiver.id)
+    sender_account_id = bank.open_account(
+        sender.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    receiver_account_id = bank.open_account(
+        receiver.id,
+        BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.deposit(sender.id, sender_account_id, 1000)
+
+    with pytest.raises(InvalidOperationError, match="не принадлежит"):
+        bank.transfer(sender.id, receiver_account_id, sender_account_id, 100)
+
+    security_events = bank.audit_log.filter(event_type="security_event")
+    assert len(security_events) == 1
+    assert security_events[0].level.value == "high"
+    assert "transfer_from_foreign_account_attempt" in security_events[0].metadata[
+        "reasons"
+    ]

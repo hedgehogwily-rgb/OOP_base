@@ -142,10 +142,34 @@ def test_project_growth(user: dict[str, Any]) -> None:
 
     acc.deposit(10000)
     acc.buy_investment("stocks", 5000)
+    acc.buy_investment("bonds", 2000)
+    acc.buy_investment("etf", 1000)
 
-    projection = acc.project_yearly_growth(0.1)
+    projection = acc.project_yearly_growth({"stocks": 0.10, "bonds": 0.04, "etf": 0.07})
 
     assert projection["stocks"] == 5500
+    assert projection["bonds"] == 2080
+    assert projection["etf"] == 1070
+
+
+def test_project_growth_rejects_unknown_asset(user: dict[str, Any]) -> None:
+    acc = InvestmentAccount(user)
+
+    with pytest.raises(InvalidOperationError, match="Неверный тип инвестиции"):
+        acc.project_yearly_growth(
+            {"stocks": 0.10, "bonds": 0.04, "etf": 0.07, "crypto": 0.2}
+        )
+
+
+def test_amount_must_be_numeric(user: dict[str, Any]) -> None:
+    acc = BankAccount(user)
+
+    with pytest.raises(InvalidOperationError, match="числом"):
+        acc.deposit(None)  # type: ignore[arg-type]
+    with pytest.raises(InvalidOperationError, match="числом"):
+        acc.deposit("100")  # type: ignore[arg-type]
+    with pytest.raises(InvalidOperationError, match="больше нуля"):
+        acc.withdraw(-1)
 
 
 def test_invalid_account_status_type(user: dict[str, Any]) -> None:

@@ -289,6 +289,39 @@ def test_bank_transfer_large_amount_blocked() -> None:
     assert "Большая сумма транзакции" in blocked[0].metadata["reasons"]
 
 
+def test_bank_transfer_at_night_blocked_by_risk_analyzer() -> None:
+    bank = Bank(now_provider=_safe_time)
+    sender = _create_client(1, "Oleg")
+    receiver = _create_client(2, "John")
+    bank.add_client(sender)
+    bank.add_client(receiver)
+    _authenticate(bank, sender.id)
+    _authenticate(bank, receiver.id)
+    sender_account_id = bank.open_account(
+        sender.id,
+        BankAccount({"name": "Oleg", "surname": "Test"}, currency=Currency.RUB),
+    )
+    receiver_account_id = bank.open_account(
+        receiver.id,
+        BankAccount({"name": "John", "surname": "Test"}, currency=Currency.RUB),
+    )
+    bank.deposit(sender.id, sender_account_id, 1000)
+
+    with pytest.raises(InvalidOperationError, match="риск-анализом"):
+        bank.transfer(
+            sender.id,
+            sender_account_id,
+            receiver_account_id,
+            100,
+            now=_quiet_time(),
+        )
+
+    assert bank.accounts[receiver_account_id].balance == 0
+    blocked = bank.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert "Операция в тихие часы" in blocked[0].metadata["reasons"]
+
+
 def test_failed_auth_recorded_in_audit_log() -> None:
     bank = Bank(now_provider=_safe_time)
     client = _create_client(1, "Oleg")
@@ -327,6 +360,7 @@ def test_foreign_account_attempt_in_audit() -> None:
     security_events = bank.audit_log.filter(event_type="security_event")
     assert len(security_events) == 1
     assert security_events[0].level.value == "high"
-    assert "transfer_from_foreign_account_attempt" in security_events[0].metadata[
-        "reasons"
-    ]
+    assert (
+        "transfer_from_foreign_account_attempt"
+        in security_events[0].metadata["reasons"]
+    )

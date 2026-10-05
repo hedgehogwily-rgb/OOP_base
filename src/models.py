@@ -16,6 +16,7 @@ from src.utils import (
     InsufficientFundsError,
     InvalidOperationError,
     QuietHoursError,
+    require_positive_amount,
 )
 
 
@@ -334,8 +335,7 @@ class TransactionProcessor:
         receiver = self.bank.accounts.get(receiver_account_id)
         if receiver is None:
             raise InvalidOperationError("Счет получателя не найден.")
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         transaction = Transaction(
             type=TransactionType.TRANSFER,
@@ -357,7 +357,12 @@ class TransactionProcessor:
     def _calculate_fee(
         self, sender: BankAccount, receiver: BankAccount, amount: float
     ) -> float:
-        return self.bank._calculate_transfer_fee(sender, receiver, amount)
+        return self.bank._calculate_transfer_fee(
+            sender,
+            receiver,
+            amount,
+            fee_rate=self.external_transfer_fee_rate,
+        )
 
     def _validate_business_rules(
         self,
@@ -374,13 +379,13 @@ class TransactionProcessor:
             transaction.sender_account_id,
             "transfer_from_foreign_account_attempt",
             now=now,
+            check_quiet_hours=False,
         )
 
         sender.check_account_availability()
         receiver.check_account_availability()
 
-        if transaction.amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(transaction.amount)
 
         if sender.balance < 0 and not isinstance(sender, PremiumAccount):
             raise InvalidOperationError(
@@ -569,16 +574,14 @@ class BankAccount(AbstractAccount):
     def deposit(self, amount: float) -> None:
         self.check_account_availability()
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         self._balance += amount
 
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         if amount > self._balance:
             raise InsufficientFundsError("Недостаточно средств.")
@@ -589,8 +592,7 @@ class BankAccount(AbstractAccount):
         self.check_account_availability()
         counterparty.check_account_availability()
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         converted_amount = self.currency_conversion(counterparty.currency, amount)
 
@@ -673,8 +675,7 @@ class SavingsAccount(BankAccount):
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         if self._balance - amount < self.min_balance:
             raise InsufficientFundsError(
@@ -733,8 +734,7 @@ class PremiumAccount(BankAccount):
     def withdraw(self, amount: float, *, apply_commission: bool = True) -> None:
         self.check_account_availability()
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         debit = amount + (self.commission if apply_commission else 0.0)
         new_balance = self._balance - debit
@@ -747,8 +747,7 @@ class PremiumAccount(BankAccount):
     def deposit(self, amount: float) -> None:
         self.check_account_availability()
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         self._balance += amount
 
@@ -811,8 +810,7 @@ class InvestmentAccount(BankAccount):
         if investment_type not in self.investment_portfolio:
             raise InvalidOperationError("Неверный тип инвестиции.")
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         if amount > self._balance:
             raise InsufficientFundsError("Недостаточно средств для покупки инвестиций.")
@@ -826,8 +824,7 @@ class InvestmentAccount(BankAccount):
         if investment_type not in self.investment_portfolio:
             raise InvalidOperationError("Неверный тип инвестиции.")
 
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
 
         if amount > self.investment_portfolio[investment_type]:
             raise InsufficientFundsError("Недостаточно инвестиций для продажи.")
@@ -835,20 +832,37 @@ class InvestmentAccount(BankAccount):
         self.investment_portfolio[investment_type] -= amount
         self._balance += amount
 
-    def project_yearly_growth(self, growth_rate: float = 0.25) -> dict[str, float]:
-        if growth_rate < 0:
-            raise InvalidOperationError("Темп роста должен быть неотрицательным.")
+    def project_yearly_growth(self, growth_rates: dict[str, float]) -> dict[str, float]:
+        if not isinstance(growth_rates, dict):
+            raise InvalidOperationError(
+                "Ставки роста должны быть словарём «тип актива → годовая ставка»."
+            )
+
+        allowed_types = set(self.investment_portfolio)
+        for asset_type, rate in growth_rates.items():
+            if asset_type not in allowed_types:
+                raise InvalidOperationError("Неверный тип инвестиции.")
+            if isinstance(rate, bool) or not isinstance(rate, int | float) or rate < 0:
+                raise InvalidOperationError(
+                    "Темп роста должен быть неотрицательным числом."
+                )
+
+        missing_types = allowed_types - set(growth_rates)
+        if missing_types:
+            missing = ", ".join(sorted(missing_types))
+            raise InvalidOperationError(
+                f"Не задана ставка роста для активов: {missing}."
+            )
 
         projected_portfolio: dict[str, float] = {}
         for investment_type, amount in self.investment_portfolio.items():
-            projected_amount = amount * (1 + growth_rate)
-            projected_portfolio[investment_type] = projected_amount
+            rate = growth_rates[investment_type]
+            projected_portfolio[investment_type] = amount * (1 + rate)
         return projected_portfolio
 
     def withdraw(self, amount: float) -> None:
         self.check_account_availability()
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
         if amount > self._balance:
             raise InsufficientFundsError(
                 "Недостаточно денежного баланса. Продайте активы."
@@ -1301,22 +1315,24 @@ class Bank:
                 metadata={"reasons": assessment.reasons},
             )
             raise InvalidOperationError(
-                "Операция заблокирована риск-анализом: "
-                + ", ".join(assessment.reasons)
+                "Операция заблокирована риск-анализом: " + ", ".join(assessment.reasons)
             )
         return assessment
 
-    def _is_external_transfer(
-        self, sender: BankAccount, receiver: BankAccount
-    ) -> bool:
+    def _is_external_transfer(self, sender: BankAccount, receiver: BankAccount) -> bool:
         return receiver.is_external
 
     def _calculate_transfer_fee(
-        self, sender: BankAccount, receiver: BankAccount, amount: float
+        self,
+        sender: BankAccount,
+        receiver: BankAccount,
+        amount: float,
+        fee_rate: float | None = None,
     ) -> float:
+        rate = self.external_transfer_fee_rate if fee_rate is None else fee_rate
         fee = 0.0
         if self._is_external_transfer(sender, receiver):
-            fee += amount * self.external_transfer_fee_rate
+            fee += amount * rate
         if isinstance(sender, PremiumAccount):
             fee += sender.commission
         return fee
@@ -1348,11 +1364,11 @@ class Bank:
             sender_account_id,
             "transfer_from_foreign_account_attempt",
             now=current_time,
+            check_quiet_hours=False,
         )
         sender = self._get_account(sender_account_id)
         receiver = self._get_account(receiver_account_id)
-        if amount <= 0:
-            raise InvalidOperationError("Сумма должна быть больше нуля.")
+        require_positive_amount(amount)
         sender.check_account_availability()
         receiver.check_account_availability()
         if sender.balance < 0 and not isinstance(sender, PremiumAccount):

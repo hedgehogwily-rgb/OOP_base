@@ -42,9 +42,9 @@ def _fund(bank: Bank, client_id: int, account_id: str, amount: float) -> None:
     bank.deposit(client_id, account_id, amount)
 
 
-def _setup_bank_and_processor() -> tuple[
-    Bank, TransactionQueue, TransactionProcessor, str, str, str
-]:
+def _setup_bank_and_processor() -> (
+    tuple[Bank, TransactionQueue, TransactionProcessor, str, str, str]
+):
     bank = Bank(now_provider=_safe_time, external_transfer_fee_rate=0.03)
     queue = TransactionQueue()
     processor = TransactionProcessor(
@@ -149,12 +149,13 @@ def test_quiet_hours_transaction_blocked() -> None:
     assert transaction.status == TransactionStatus.FAILED
     assert bank.accounts[ivan_id].balance == 0
 
-    failed = processor.audit_log.filter(event_type="transaction_failed")
-    assert len(failed) == 1
-
     risk_events = processor.audit_log.filter(event_type="risk_detected")
     assert len(risk_events) == 1
-    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]
+    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
+    assert processor.audit_log.filter(event_type="transaction_failed") == []
 
 
 def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
@@ -168,12 +169,14 @@ def test_quiet_hours_uses_process_time_not_bank_clock() -> None:
     assert transaction.status == TransactionStatus.FAILED
     assert bank.is_quiet_hours(_safe_time()) is False
 
-    failed = processor.audit_log.filter(event_type="transaction_failed")
-    assert len(failed) == 1
+    assert processor.audit_log.filter(event_type="transaction_failed") == []
 
     risk_events = processor.audit_log.filter(event_type="risk_detected")
     assert len(risk_events) == 1
-    assert "operation_during_quiet_hours" in risk_events[0].metadata["reasons"]
+    assert "Операция в тихие часы" in risk_events[0].metadata["reasons"]
+
+    blocked = processor.audit_log.filter(event_type="transaction_blocked")
+    assert len(blocked) == 1
 
 
 def test_frozen_account_rejected() -> None:
@@ -213,6 +216,21 @@ def test_premium_transfer_fee_in_transaction() -> None:
     assert transaction.status == TransactionStatus.COMPLETED
     assert transaction.fee == 10.0
     assert bank.accounts[ivan_id].balance == 5000 - 700 - 10
+
+
+def test_processor_fee_rate_is_used_instead_of_bank_rate() -> None:
+    bank, _, processor, oleg_id, john_id, _ = _setup_bank_and_processor()
+    bank.external_transfer_fee_rate = 0.01
+    processor.external_transfer_fee_rate = 0.05
+    _fund(bank, 1, oleg_id, 1000)
+    bank.accounts[john_id].is_external = True
+
+    transaction = processor.create_transfer(1, oleg_id, john_id, 100, max_attempts=1)
+    processor.process_next(now=_safe_time())
+
+    assert transaction.status == TransactionStatus.COMPLETED
+    assert transaction.fee == 5
+    assert bank.accounts[oleg_id].balance == 895
 
 
 def test_external_transfer_fee_applied() -> None:

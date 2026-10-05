@@ -24,3 +24,10 @@ class InvalidOperationError(DomainError):
 
 class QuietHoursError(InvalidOperationError):
     default_message = "Операции запрещены с 00:00 до 05:00."
+
+
+def require_positive_amount(amount: object) -> None:
+    if isinstance(amount, bool) or not isinstance(amount, int | float):
+        raise InvalidOperationError("Сумма должна быть числом.")
+    if amount <= 0:
+        raise InvalidOperationError("Сумма должна быть больше нуля.")
